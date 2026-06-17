@@ -1,0 +1,42 @@
+# Build directories
+build/
+build-*/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+!nix/*.nix
+
+# Ninja
+.ninja_deps
+.ninja_log
+
+# Qt
+moc_*
+*.moc
+qrc_*
+
+# Libraries
+*.a
+*.so
+*.dylib
+*.dll
+
+# Executables
+*.exe
+
+# OS
+.DS_Store
+Thumbs.db
+result
