@@ -6,25 +6,37 @@ on:
   pull_request:
     branches: [master, main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   nix-tests:
-    runs-on: ubuntu-latest
+    name: nix-tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            system: x86_64-linux
+          - os: macos-latest
+            system: aarch64-darwin
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v27
-        with:
-          extra_nix_config: |
-            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
-            experimental-features = nix-command flakes
+        uses: DeterminateSystems/nix-installer-action@main
 
-      - uses: cachix/cachix-action@v15
+      - name: Setup Cachix
+        uses: cachix/cachix-action@v15
         with:
           name: logos-co
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
 
       - name: Build and run tests (flake check)
-        run: nix build .#checks.x86_64-linux.tests -L
+        run: nix build .#checks.${{ matrix.system }}.tests -L
