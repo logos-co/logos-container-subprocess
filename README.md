@@ -19,21 +19,34 @@ logos-container                 (ModuleContainer interface + descriptor types)
 
 ## What's here
 
-Two static libraries, split by dependency surface:
+A single Qt-free static library, `logos_container_subprocess`:
 
-| Library | Side | Source | Depends on |
-|---------|------|--------|-----------|
-| `logos_container_subprocess` | parent | `subprocess_container.{h,cpp}` | Boost.Process, spdlog, logos-container. |
+| Source | Role |
+|--------|------|
+| `subprocess_container.{h,cpp}` | `SubprocessContainer` — the `ModuleContainer` implementation. |
+| `subprocess_container_factory.cpp` | Defines `LogosCore::makeContainer()` (the logos-container factory seam) → a `SubprocessContainer`, so a consumer selects this container at link time without naming it. |
 
-The parent (`SubprocessContainer`) launches and supervises module processes via
-Boost.Process v2, relays their stdout/stderr line-by-line (with a bounded
-buffer so a module can't OOM the host), detects crashes, and delivers the auth
-token to the child. The child (`SubprocessTokenReceiver`) receives that token
-over a `QLocalServer` socket. Both sides authenticate the peer by uid (and pid
-where available) so a same-host attacker cannot intercept or inject the token.
+`SubprocessContainer` launches and supervises module processes via Boost.Process
+v2, relays their stdout/stderr line-by-line (with a bounded buffer so a module
+can't OOM the host), detects crashes, and delivers the auth token to the child
+over the child's **inherited stdin pipe** (the parent writes the token and closes
+it). There is no child-side library and no socket: the child just reads its token
+from stdin (handled by `logos_host`'s `TokenSource`), so there is no predictable
+filesystem path to squat and no peer-credential dance.
 
-Supporting headers (`peer_credentials.h`, `unix_socket_path.h`,
-`path_safety.h`) are the shared handoff helpers.
+### Consuming it
+
+This package installs a generic CMake config so a consumer selects "the container
+implementation" without naming this one:
+
+```cmake
+find_package(LogosContainerImpl REQUIRED)   # provided by this package
+target_link_libraries(your_target PRIVATE LogosContainerImpl::impl)
+```
+
+`LogosContainerImpl::impl` carries the static library plus its own deps
+(Boost.Process, spdlog, nlohmann_json). A different container implementation that
+ships the same `LogosContainerImpl` config is a drop-in replacement.
 
 ## Build & test
 

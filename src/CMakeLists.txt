@@ -29,6 +29,9 @@ set_target_properties(logos_container PROPERTIES
 add_library(logos_container_subprocess STATIC
     subprocess_container.cpp
     subprocess_container.h
+    # Provides LogosCore::makeContainer() (logos-container factory seam) so
+    # consumers select this container at link time without naming it.
+    subprocess_container_factory.cpp
 )
 
 target_link_libraries(logos_container_subprocess PUBLIC
