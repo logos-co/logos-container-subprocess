@@ -24,7 +24,6 @@ Two static libraries, split by dependency surface:
 | Library | Side | Source | Depends on |
 |---------|------|--------|-----------|
 | `logos_container_subprocess` | parent | `subprocess_container.{h,cpp}` | Boost.Process, spdlog, logos-container. |
-| `logos_container_subprocess_host` | child | `token_receiver.{h,cpp}` | Qt::Network, spdlog, logos-container |
 
 The parent (`SubprocessContainer`) launches and supervises module processes via
 Boost.Process v2, relays their stdout/stderr line-by-line (with a bounded

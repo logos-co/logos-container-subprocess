@@ -1,11 +1,3 @@
-// _GNU_SOURCE exposes struct ucred / SO_PEERCRED from <sys/socket.h> on glibc.
-// Must precede any system header. CMake's default -std=gnu++17 predefines it,
-// but pin it here so the peer-credential check below compiles regardless of
-// the C++ dialect a downstream consumer builds us with.
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE 1
-#endif
-
 #include "subprocess_container.h"
 
 #include <boost/asio/connect_pipe.hpp>
@@ -14,27 +6,16 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/readable_pipe.hpp>
 #include <boost/asio/writable_pipe.hpp>
+#include <boost/asio/write.hpp>
 #include <boost/process/v2/process.hpp>
 #include <boost/process/v2/stdio.hpp>
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-#include "peer_credentials.h"
-#include "unix_socket_path.h"
-#include <logos_container/module_name_validation.h>
-
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -85,6 +66,12 @@ struct ProcessEntry {
     bp2::process                              process;
     asio::readable_pipe                       out_pipe;
     asio::readable_pipe                       err_pipe;
+    // Parent write-end of the child's stdin. The auth token is delivered by
+    // writing it here (see sendTokenToProcess): the child inherited the read
+    // end as fd 0, so this pipe is private to the parent/child pair —
+    // unforgeable, with no predictable filesystem path to squat. Held open
+    // from launch until sendToken writes the token and closes it.
+    asio::writable_pipe                       in_pipe;
     SubprocessContainer::ProcessCallbacks     callbacks;
     std::string                               name;
     std::array<char, 4096>                    out_read_buf{};
@@ -96,10 +83,12 @@ struct ProcessEntry {
 
     ProcessEntry(bp2::process proc,
                  asio::readable_pipe out_rp, asio::readable_pipe err_rp,
+                 asio::writable_pipe in_wp,
                  const std::string& n, const SubprocessContainer::ProcessCallbacks& cb)
         : process(std::move(proc))
         , out_pipe(std::move(out_rp))
         , err_pipe(std::move(err_rp))
+        , in_pipe(std::move(in_wp))
         , name(n)
         , callbacks(cb)
     {}
@@ -159,130 +148,6 @@ IoRuntime::~IoRuntime() {
         std::lock_guard<std::mutex> lock(s_processesMutex);
         s_processes.clear();
     }
-}
-
-// ---------------------------------------------------------------------------
-// Unix domain socket path
-// ---------------------------------------------------------------------------
-
-// Resolve the socket path via the shared Qt-free helper. The child
-// (qt_token_receiver) computes the same path with the same helper and
-// passes it to QLocalServer::listen() as an absolute path, so Qt's
-// QDir::tempPath() resolution is bypassed on both sides.
-using ::logos::unixSocketPath;
-
-// ---------------------------------------------------------------------------
-// Listener authentication (CWE-940)
-// ---------------------------------------------------------------------------
-//
-// The token socket lives at a predictable path under a world-writable temp
-// dir (see unix_socket_path.h) and we connect() to it in a retry loop. A
-// successful connect() proves only that *something* is listening there — not
-// that it is the child module we spawned. A local co-tenant can pre-bind that
-// path before the real child calls listen(); our connect() then lands on the
-// attacker's socket and, without this check, write()s the genuine auth token
-// straight to them. They replay it as `authToken` to make authorized
-// cross-module calls.
-//
-// Before writing the secret we verify the peer's kernel-reported credentials:
-//   - the peer must run as our own euid (no other user may receive the token);
-//   - when we know the child's pid (the common case — launch() records it
-//     before sendToken() runs), the peer must be exactly that process.
-//
-// Any failure is fatal: we refuse to write the token rather than risk leaking
-// it. This is the sender/parent half of the handoff (CWE-940 / finding F-010);
-// the child/receiver side (token_receiver.cpp) has a symmetric exposure that
-// still needs the mirror-image peer check.
-//
-// The peer pid comes from SO_PEERCRED on Linux and getsockopt(SOL_LOCAL,
-// LOCAL_PEERPID) on macOS, so both platforms enforce the uid+pid gate.
-//
-// Residual risk: when no child pid is recorded (e.g. the placeholder path used
-// by some callers) only the uid gate applies, so a same-uid co-tenant could
-// still receive the token. Even with the pid gate, a same-uid attacker can in
-// principle race for the path between the child's listen() and our connect().
-// The race window is fully closed only by handing the child a pre-connected
-// socketpair() fd instead of a named path — see the note in docs/spec.md.
-// The peer-credential check is the defense-in-depth that closes the cross-uid
-// theft this finding describes and, when the child pid is known, the same-uid
-// squat as well.
-//
-// Returns true if the connected peer is acceptable, false if the token must
-// not be written. `expectedPid <= 0` means "child pid unknown, skip the pid
-// gate" (the uid gate still applies).
-bool peerIsTrusted(int sock, int64_t expectedPid, const std::string& name)
-{
-#if defined(__linux__)
-    struct ucred cred{};
-    socklen_t len = sizeof(cred);
-    if (::getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) {
-        spdlog::warn("SO_PEERCRED failed for token peer of {}: {}",
-                                    name, strerror(errno));
-        return false;
-    }
-    if (cred.uid != ::geteuid()) {
-        spdlog::warn(
-            "token peer uid mismatch for {} (peer uid {} != {}); refusing to send token",
-            name, static_cast<unsigned>(cred.uid), static_cast<unsigned>(::geteuid()));
-        return false;
-    }
-    if (expectedPid > 0 && static_cast<int64_t>(cred.pid) != expectedPid) {
-        spdlog::warn(
-            "token peer pid mismatch for {} (peer pid {} != child {}); refusing to send token",
-            name, static_cast<int>(cred.pid), static_cast<long long>(expectedPid));
-        return false;
-    }
-    return true;
-#elif defined(__APPLE__)
-    // macOS has no SO_PEERCRED/ucred, but it exposes the two facts we need
-    // through separate APIs: getpeereid() for the peer's effective uid, and
-    // getsockopt(SOL_LOCAL, LOCAL_PEERPID) for the peer's pid (since macOS
-    // 10.8). Checking both gives parity with the Linux uid+pid gate, so a
-    // same-uid co-tenant squatting the path is rejected on the pid mismatch
-    // just as it is on Linux — not only the cross-uid theft.
-    uid_t peerUid = 0;
-    gid_t peerGid = 0;
-    if (::getpeereid(sock, &peerUid, &peerGid) != 0) {
-        spdlog::warn("getpeereid failed for token peer of {}: {}",
-                                    name, strerror(errno));
-        return false;
-    }
-    if (peerUid != ::geteuid()) {
-        spdlog::warn(
-            "token peer uid mismatch for {} (peer uid {} != {}); refusing to send token",
-            name, static_cast<unsigned>(peerUid), static_cast<unsigned>(::geteuid()));
-        return false;
-    }
-    // When the child pid is known, enforce it too. LOCAL_PEERPID reports the
-    // pid of the process that connect()ed the socket — exactly the peer we are
-    // about to hand the token to. A getsockopt failure (e.g. EOPNOTSUPP on a
-    // pre-10.8 kernel) is fatal: we fail closed rather than silently downgrade
-    // to the uid-only gate and leak the token to a same-uid squatter.
-    if (expectedPid > 0) {
-        pid_t peerPid = 0;
-        socklen_t pidLen = sizeof(peerPid);
-        if (::getsockopt(sock, SOL_LOCAL, LOCAL_PEERPID, &peerPid, &pidLen) != 0) {
-            spdlog::warn(
-                "LOCAL_PEERPID failed for token peer of {}: {}; refusing to send token",
-                name, strerror(errno));
-            return false;
-        }
-        if (static_cast<int64_t>(peerPid) != expectedPid) {
-            spdlog::warn(
-                "token peer pid mismatch for {} (peer pid {} != child {}); refusing to send token",
-                name, static_cast<int>(peerPid), static_cast<long long>(expectedPid));
-            return false;
-        }
-    }
-    return true;
-#else
-    // Unknown platform: we cannot authenticate the peer, so we cannot make
-    // the security guarantee. Fail closed rather than leak the token.
-    (void)sock; (void)expectedPid;
-    spdlog::error(
-        "no peer-credential API on this platform; refusing to send token for {}", name);
-    return false;
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +267,10 @@ void syncKill(std::shared_ptr<ProcessEntry> entry) {
     boost::system::error_code ec;
     entry->out_pipe.close(ec);
     entry->err_pipe.close(ec);
+    // Close the stdin write end too: if we kill the child before a token was
+    // delivered, this gives it EOF on fd 0 so a blocking token read returns
+    // instead of hanging until the wait deadline.
+    entry->in_pipe.close(ec);
 
     entry->process.request_exit(ec);
 
@@ -491,7 +360,15 @@ bool SubprocessContainer::launch(const LogosCore::ModuleDescriptor& desc,
             spdlog::info("[{}] {}", pName, line);
     };
 
-    if (!startProcess(desc.name, hostBinary, args, callbacks))
+    // Tell the host where to read its auth token: this container delivers it
+    // over the child's stdin (see sendTokenToProcess). Token delivery is the
+    // container's responsibility — the host stays agnostic and just reads the
+    // channel we name here. A different container would name a different one.
+    std::vector<std::string> launchArgs = args;
+    launchArgs.push_back("--token-source");
+    launchArgs.push_back("stdin");
+
+    if (!startProcess(desc.name, hostBinary, launchArgs, callbacks))
         return false;
 
     out.name = desc.name;
@@ -546,6 +423,14 @@ bool SubprocessContainer::startProcess(const std::string& name, const std::strin
     asio::readable_pipe out_rpipe(rt.ctx), err_rpipe(rt.ctx);
     asio::writable_pipe out_wpipe(rt.ctx), err_wpipe(rt.ctx);
 
+    // Child stdin: the parent keeps in_wpipe and writes the auth token to it in
+    // sendTokenToProcess; the child inherits in_rpipe as fd 0 and reads its
+    // token from stdin (see --token-source). A private inherited pipe with no
+    // filesystem name, so there is nothing for a co-tenant to squat or
+    // authenticate against — this replaces the old predictable-socket handoff.
+    asio::readable_pipe in_rpipe(rt.ctx);
+    asio::writable_pipe in_wpipe(rt.ctx);
+
     asio::connect_pipe(out_rpipe, out_wpipe, ec);
     if (ec) {
         spdlog::error("Failed to create stdout pipe for {}: {}",
@@ -558,8 +443,15 @@ bool SubprocessContainer::startProcess(const std::string& name, const std::strin
                                      name, ec.message());
         return false;
     }
+    asio::connect_pipe(in_rpipe, in_wpipe, ec);
+    if (ec) {
+        spdlog::error("Failed to create stdin pipe for {}: {}",
+                                     name, ec.message());
+        return false;
+    }
 
     bp2::process_stdio pstdio;
+    pstdio.in  = in_rpipe;
     pstdio.out = out_wpipe;
     pstdio.err = err_wpipe;
 
@@ -567,6 +459,7 @@ bool SubprocessContainer::startProcess(const std::string& name, const std::strin
 
     out_wpipe.close();
     err_wpipe.close();
+    in_rpipe.close();   // child holds its own copy; parent only needs in_wpipe
 
     if (ec) {
         spdlog::error("Failed to start process for {}: {}",
@@ -575,7 +468,8 @@ bool SubprocessContainer::startProcess(const std::string& name, const std::strin
     }
 
     auto entry = std::make_shared<ProcessEntry>(
-        std::move(proc), std::move(out_rpipe), std::move(err_rpipe), name, callbacks);
+        std::move(proc), std::move(out_rpipe), std::move(err_rpipe),
+        std::move(in_wpipe), name, callbacks);
 
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
@@ -593,153 +487,59 @@ bool SubprocessContainer::startProcess(const std::string& name, const std::strin
 
 bool SubprocessContainer::sendTokenToProcess(const std::string& name,
                                               const std::string& token,
-                                              int max_wait_ms)
+                                              int /*max_wait_ms*/)
 {
-    // Defense-in-depth: `name` is validated at the registry trust boundary
-    // (ModuleRegistry::processModuleInternal), but the token-handoff socket
-    // filename must never depend on raw caller input even if some future path
-    // reaches here without going through registration. A name with '/' or
-    // ".." would otherwise escape qtCompatibleTempDir() and let the parent
-    // connect() to an attacker-controlled path, leaking the auth token
-    // (CWE-22). See module_name_validation.h.
-    if (!logos::isValidModuleName(name)) {
-        spdlog::error(
-            "Refusing token handoff for invalid module name: {}", name);
-        std::shared_ptr<ProcessEntry> entry;
-        {
-            std::lock_guard<std::mutex> lock(s_processesMutex);
-            auto it = s_processes.find(name);
-            if (it != s_processes.end()) {
-                entry = it->second;
-                s_processes.erase(it);
-            }
-        }
-        syncKill(entry);
-        return false;
-    }
-
-    const char* instanceId = std::getenv("LOGOS_INSTANCE_ID");
-    std::string socketName = "logos_token_" + name;
-    if (instanceId && *instanceId) {
-        socketName += "_";
-        socketName += instanceId;
-    }
-    std::string path = unixSocketPath(socketName);
-
+    // Deliver the token over the child's stdin pipe, set up in startProcess().
+    // The child inherited the read end as fd 0 and blocks reading its token
+    // there (see --token-source stdin in logos_host). This pipe is private to
+    // the parent/child pair and has no filesystem name, so there is no
+    // predictable path to squat and no peer to authenticate — the whole
+    // CWE-940 / F-012 socket-handoff hardening is unnecessary by construction.
+    //
+    // A trailing newline frames the token so the child can read exactly one
+    // line; we then close our write end (EOF) to release the child even if it
+    // reads to end-of-stream.
+    std::shared_ptr<ProcessEntry> entry;
     {
-        struct sockaddr_un sample{};
-        if (path.size() >= sizeof(sample.sun_path)) {
-            spdlog::error("Unix socket path too long ({} >= {}): {}",
-                                         path.size(), sizeof(sample.sun_path), path);
-            std::shared_ptr<ProcessEntry> entry;
-            {
-                std::lock_guard<std::mutex> lock(s_processesMutex);
-                auto it = s_processes.find(name);
-                if (it != s_processes.end()) {
-                    entry = it->second;
-                    s_processes.erase(it);
-                }
-            }
-            syncKill(entry);
-            return false;
-        }
+        std::lock_guard<std::mutex> lock(s_processesMutex);
+        auto it = s_processes.find(name);
+        if (it != s_processes.end())
+            entry = it->second;
     }
 
-    using clock = std::chrono::steady_clock;
-    const auto deadline = clock::now() + std::chrono::milliseconds(max_wait_ms);
-
-    // The child we spawned, if known. launch() -> startProcess() records the
-    // child's pid before sendToken() runs, so in the normal load path this is
-    // the genuine child's pid and lets us reject any other listener squatting
-    // the predictable socket path. -1 (placeholder / unknown) skips the pid
-    // gate but still enforces the uid gate in peerIsTrusted().
-    const int64_t expectedPid = getProcessId(name);
-
-    int sock = -1;
-    for (;;) {
-        sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
-        if (sock < 0) {
-            spdlog::error("socket() failed: {}", strerror(errno));
-            break;
-        }
-
-        struct sockaddr_un addr{};
-        addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
-
-        if (::connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
-            // connect() only proves something is listening at this predictable,
-            // world-writable path — not that it is our child. Authenticate the
-            // peer before writing the secret (CWE-940). A trusted peer ends the
-            // loop; an untrusted one is treated like a failed connect, so a
-            // co-tenant squatting the path cannot steal the token and the real
-            // child can still claim the path before the deadline.
-            if (peerIsTrusted(sock, expectedPid, name))
-                break;
-            ::close(sock);
-            sock = -1;
-            if (clock::now() >= deadline) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
-        }
-
-        ::close(sock);
-        sock = -1;
-        if (clock::now() >= deadline) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (!entry) {
+        spdlog::error("No process entry to deliver token to for: {}", name);
+        return false;
     }
 
-    if (sock < 0) {
-        spdlog::error("Failed to connect to token socket for: {}", name);
+    std::string payload = token;
+    payload.push_back('\n');
 
-        std::shared_ptr<ProcessEntry> entry;
+    boost::system::error_code ec;
+    boost::asio::write(entry->in_pipe, boost::asio::buffer(payload), ec);
+
+    // Close the write end so the child sees EOF after the token. Best-effort:
+    // even if the close reports an error the token bytes were already written.
+    boost::system::error_code close_ec;
+    entry->in_pipe.close(close_ec);
+
+    if (ec) {
+        spdlog::error("Failed to write token to stdin pipe for {}: {}",
+                      name, ec.message());
+        std::shared_ptr<ProcessEntry> dead;
         {
             std::lock_guard<std::mutex> lock(s_processesMutex);
             auto it = s_processes.find(name);
             if (it != s_processes.end()) {
-                entry = it->second;
+                dead = it->second;
                 s_processes.erase(it);
             }
         }
-        syncKill(entry);
+        syncKill(dead);
         return false;
     }
 
-    // Authenticate the listener before handing it the token. The socket path
-    // is public and predictable under the world-writable $TMPDIR, so a
-    // co-tenant attacker could win the race to create the listener we just
-    // connect()ed to. Only deliver the credential if the peer runs as our own
-    // uid (the legitimate child host); otherwise we'd be leaking the token to
-    // a hostile process (F-012, CWE-862). Symmetric with the receiver's check.
-    if (!::logos::socketPeerIsSameUid(sock)) {
-        spdlog::warn(
-            "Refusing to send token to untrusted listener (uid mismatch) for: {}", name);
-        ::close(sock);
-
-        std::shared_ptr<ProcessEntry> entry;
-        {
-            std::lock_guard<std::mutex> lock(s_processesMutex);
-            auto it = s_processes.find(name);
-            if (it != s_processes.end()) {
-                entry = it->second;
-                s_processes.erase(it);
-            }
-        }
-        syncKill(entry);
-        return false;
-    }
-
-    const char* data = token.c_str();
-    std::size_t total = token.size();
-    std::size_t written = 0;
-    while (written < total) {
-        ssize_t n = ::write(sock, data + written, total - written);
-        if (n <= 0) break;
-        written += static_cast<std::size_t>(n);
-    }
-
-    ::close(sock);
-    return written == total;
+    return true;
 }
 
 void SubprocessContainer::terminateProcess(const std::string& name)

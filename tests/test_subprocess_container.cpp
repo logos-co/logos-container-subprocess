@@ -28,10 +28,17 @@ protected:
     void TearDown() override { SubprocessContainer::clearAll(); }
 };
 
-static const char* sleepBinary() {
-    if (access("/bin/sleep", X_OK) == 0) return "/bin/sleep";
-    if (access("/usr/bin/sleep", X_OK) == 0) return "/usr/bin/sleep";
-    return nullptr;
+// Launch a fake module host under `name` that stays alive ~5s. It must tolerate
+// the extra CLI args the container appends in launch() (e.g. --token-source
+// stdin): /bin/sleep can't be used directly because it rejects unknown options,
+// so we run a shell that execs sleep and ignores the trailing args. exec keeps
+// the pid stable (the shell becomes sleep), matching what the pid assertions
+// expect.
+static bool launchFakeModule(SubprocessContainer& c, const char* name,
+                             LogosCore::LoadedModuleHandle& handle) {
+    LogosCore::ModuleDescriptor desc;
+    desc.name = name;
+    return c.launch(desc, "/bin/sh", {"-c", "exec sleep 5"}, nullptr, handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -59,40 +66,22 @@ TEST_F(SubprocessContainerTest, Id_ReturnsSubprocess) {
 // ---------------------------------------------------------------------------
 
 TEST_F(SubprocessContainerTest, Launch_StartsProcessAndPopulatesHandle) {
-    const char* sleep = sleepBinary();
-    if (!sleep) GTEST_SKIP() << "sleep binary not found";
-
-    LogosCore::ModuleDescriptor desc;
-    desc.name = "launch_test";
     LogosCore::LoadedModuleHandle handle;
-
-    bool ok = container.launch(desc, sleep, {"5"}, nullptr, handle);
+    bool ok = launchFakeModule(container, "launch_test", handle);
     EXPECT_TRUE(ok);
     EXPECT_EQ(handle.name, "launch_test");
     EXPECT_GT(handle.pid, 0);
 }
 
 TEST_F(SubprocessContainerTest, Launch_HasModuleReturnsTrueAfterLaunch) {
-    const char* sleep = sleepBinary();
-    if (!sleep) GTEST_SKIP() << "sleep binary not found";
-
-    LogosCore::ModuleDescriptor desc;
-    desc.name = "has_mod";
     LogosCore::LoadedModuleHandle handle;
-
-    container.launch(desc, sleep, {"5"}, nullptr, handle);
+    launchFakeModule(container, "has_mod", handle);
     EXPECT_TRUE(container.hasModule("has_mod"));
 }
 
 TEST_F(SubprocessContainerTest, Launch_PidReturnsPidAfterLaunch) {
-    const char* sleep = sleepBinary();
-    if (!sleep) GTEST_SKIP() << "sleep binary not found";
-
-    LogosCore::ModuleDescriptor desc;
-    desc.name = "pid_mod";
     LogosCore::LoadedModuleHandle handle;
-
-    container.launch(desc, sleep, {"5"}, nullptr, handle);
+    launchFakeModule(container, "pid_mod", handle);
     auto pid = container.pid("pid_mod");
     ASSERT_TRUE(pid.has_value());
     EXPECT_GT(*pid, 0);
@@ -113,14 +102,8 @@ TEST_F(SubprocessContainerTest, Launch_FailsForNonexistentBinary) {
 // ---------------------------------------------------------------------------
 
 TEST_F(SubprocessContainerTest, Terminate_RemovesModule) {
-    const char* sleep = sleepBinary();
-    if (!sleep) GTEST_SKIP() << "sleep binary not found";
-
-    LogosCore::ModuleDescriptor desc;
-    desc.name = "term_mod";
     LogosCore::LoadedModuleHandle handle;
-
-    container.launch(desc, sleep, {"5"}, nullptr, handle);
+    launchFakeModule(container, "term_mod", handle);
     ASSERT_TRUE(container.hasModule("term_mod"));
 
     container.terminate("term_mod");
@@ -128,18 +111,10 @@ TEST_F(SubprocessContainerTest, Terminate_RemovesModule) {
 }
 
 TEST_F(SubprocessContainerTest, TerminateAll_RemovesAllModules) {
-    const char* sleep = sleepBinary();
-    if (!sleep) GTEST_SKIP() << "sleep binary not found";
-
-    LogosCore::ModuleDescriptor desc1;
-    desc1.name = "ta_1";
     LogosCore::LoadedModuleHandle h1;
-    container.launch(desc1, sleep, {"5"}, nullptr, h1);
-
-    LogosCore::ModuleDescriptor desc2;
-    desc2.name = "ta_2";
+    launchFakeModule(container, "ta_1", h1);
     LogosCore::LoadedModuleHandle h2;
-    container.launch(desc2, sleep, {"5"}, nullptr, h2);
+    launchFakeModule(container, "ta_2", h2);
 
     container.terminateAll();
 
@@ -152,18 +127,10 @@ TEST_F(SubprocessContainerTest, TerminateAll_RemovesAllModules) {
 // ---------------------------------------------------------------------------
 
 TEST_F(SubprocessContainerTest, GetAllPids_ReturnsAllRunningPids) {
-    const char* sleep = sleepBinary();
-    if (!sleep) GTEST_SKIP() << "sleep binary not found";
-
-    LogosCore::ModuleDescriptor d1;
-    d1.name = "gp_a";
     LogosCore::LoadedModuleHandle h1;
-    container.launch(d1, sleep, {"5"}, nullptr, h1);
-
-    LogosCore::ModuleDescriptor d2;
-    d2.name = "gp_b";
+    launchFakeModule(container, "gp_a", h1);
     LogosCore::LoadedModuleHandle h2;
-    container.launch(d2, sleep, {"5"}, nullptr, h2);
+    launchFakeModule(container, "gp_b", h2);
 
     auto pids = container.getAllPids();
     EXPECT_EQ(pids.size(), 2u);
@@ -362,6 +329,54 @@ TEST_F(SubprocessContainerTest, Launch_OnFinishedReportsCrashedOnSignal) {
     // feeds upstream observers via their own ProcessEntry cleanup.
     EXPECT_FALSE(container.hasModule("crash_test"));
     EXPECT_FALSE(container.pid("crash_test").has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Token delivery over the child's stdin pipe
+//
+// sendToken/sendTokenToProcess writes the auth token to the child's stdin (a
+// private inherited pipe, set up in startProcess) followed by a newline, then
+// closes the write end. The child reads its token from fd 0. This replaced the
+// old predictable-socket handoff; here we prove the token actually arrives by
+// spawning a shell that reads one line from stdin and echoes it back on
+// stdout, which the container relays to onOutput.
+// ---------------------------------------------------------------------------
+
+TEST_F(SubprocessContainerTest, SendToken_DeliversTokenOverStdin) {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::string received;
+    std::atomic<bool> got{false};
+
+    SubprocessContainer::ProcessCallbacks cb;
+    cb.onOutput = [&](const std::string&, const std::string& line, bool isStderr) {
+        if (isStderr) return;
+        std::lock_guard<std::mutex> lock(mtx);
+        if (line.rfind("GOT:", 0) == 0) {       // line starts with "GOT:"
+            received = line.substr(4);
+            got.store(true);
+            cv.notify_all();
+        }
+    };
+
+    // `read tok` consumes exactly the one newline-terminated line the parent
+    // writes; the child then echoes it so the test can observe what arrived.
+    ASSERT_TRUE(SubprocessContainer::startProcess(
+        "tok_stdin", "/bin/sh", {"-c", "read tok; echo \"GOT:$tok\""}, cb));
+
+    const std::string secret = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+    EXPECT_TRUE(SubprocessContainer::sendTokenToProcess("tok_stdin", secret));
+
+    std::unique_lock<std::mutex> lock(mtx);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return got.load(); }))
+        << "child never echoed a token read from stdin";
+    EXPECT_EQ(received, secret)
+        << "token delivered over stdin did not match what the parent sent";
+}
+
+TEST_F(SubprocessContainerTest, SendToken_FailsForUnknownProcess) {
+    // No entry registered for this name → nothing to write the token to.
+    EXPECT_FALSE(SubprocessContainer::sendTokenToProcess("no_such_module", "tok"));
 }
 
 // ---------------------------------------------------------------------------

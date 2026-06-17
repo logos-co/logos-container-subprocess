@@ -9,14 +9,13 @@
     pkgs.cmake
     pkgs.ninja
     pkgs.pkg-config
-    pkgs.qt6.wrapQtAppsNoGuiHook
   ];
 
-  # Qt6 is listed explicitly (not propagated by deps) — qtbase's setup hook
-  # must be sourced after wrapQtAppsHook. Boost/spdlog/nlohmann back the
-  # parent and child sides; logosContainer provides the contract + logging.
+  # Boost (Process/Asio) drives the child process and the stdin token pipe;
+  # spdlog is the logger; nlohmann backs the contract's descriptor types;
+  # logosContainer provides the ModuleContainer interface header. No Qt — the
+  # child side is just a stdin read, handled by the host binary in liblogos.
   buildInputs = [
-    pkgs.qt6.qtbase
     pkgs.boost
     pkgs.nlohmann_json
     pkgs.spdlog

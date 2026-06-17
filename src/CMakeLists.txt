@@ -1,16 +1,14 @@
 # The subprocess container: a ModuleContainer implementation that isolates each
-# module in its own child process. Two compiled units, split by their dependency
-# surface:
+# module in its own child process via Boost.Process v2. It launches and
+# supervises the child, relays its stdout/stderr line-by-line (bounded so a
+# module can't OOM the host), detects crashes, and delivers the module's auth
+# token over the child's stdin (a private inherited pipe — no predictable
+# filesystem path, so no socket-squat attack surface).
 #
-#   logos_container_subprocess       parent side — Boost.Process lifecycle +
-#                                    the auth-token sender. Qt-free.
-#   logos_container_subprocess_host  child side — receives the auth token over a
-#                                    QLocalServer Unix socket. Links Qt::Network.
-#
-# Both depend only on the logos-container contract (the ModuleContainer
-# interface, the ModuleDescriptor value types, and the shared module-name
-# allowlist). A different container (Docker, in-process) would be a sibling
-# repo implementing the same contract.
+# Qt-free: the child side is just "read your token from fd 0", handled by the
+# host binary in logos-liblogos, so this package no longer ships any child-side
+# code. A different container (Docker, in-process) would be a sibling repo
+# implementing the same logos-container contract.
 
 # ---------------------------------------------------------------------------
 # logos-container contract (header-only, imported as an INTERFACE target)
@@ -26,7 +24,7 @@ set_target_properties(logos_container PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
-# Parent side — the ModuleContainer (Qt-free)
+# The subprocess container (Qt-free)
 # ---------------------------------------------------------------------------
 add_library(logos_container_subprocess STATIC
     subprocess_container.cpp
@@ -40,26 +38,6 @@ target_link_libraries(logos_container_subprocess PUBLIC
 )
 
 target_include_directories(logos_container_subprocess PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-    $<INSTALL_INTERFACE:include/logos_container_subprocess>
-)
-
-# ---------------------------------------------------------------------------
-# Child side — the token receiver used by a module host (Qt::Network)
-# ---------------------------------------------------------------------------
-add_library(logos_container_subprocess_host STATIC
-    token_receiver.cpp
-    token_receiver.h
-)
-
-target_link_libraries(logos_container_subprocess_host PUBLIC
-    logos_container
-    Qt${QT_VERSION_MAJOR}::Core
-    Qt${QT_VERSION_MAJOR}::Network
-    spdlog::spdlog
-)
-
-target_include_directories(logos_container_subprocess_host PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:include/logos_container_subprocess>
 )

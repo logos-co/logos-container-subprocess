@@ -4,11 +4,7 @@ project(LogosContainerSubprocess LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Qt (Core + Network) for the child-side token receiver (QLocalServer/QLocalSocket).
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Core Network)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Core Network)
-
-# Boost.Process/Asio for the parent-side process lifecycle.
+# Boost.Process/Asio for the process lifecycle and the stdin token pipe.
 find_package(Boost REQUIRED COMPONENTS process)
 
 find_package(nlohmann_json REQUIRED)
@@ -43,7 +39,7 @@ include(GoogleTest)
 add_subdirectory(tests)
 
 # Install rules
-install(TARGETS logos_container_subprocess logos_container_subprocess_host
+install(TARGETS logos_container_subprocess
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )

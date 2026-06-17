@@ -69,7 +69,6 @@
             pkgs.pkg-config
           ];
           buildInputs = [
-            pkgs.qt6.qtbase
             pkgs.boost
             pkgs.nlohmann_json
             pkgs.spdlog
