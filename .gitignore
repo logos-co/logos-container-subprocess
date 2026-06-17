@@ -17,6 +17,10 @@ Makefile
 *.cmake
 !CMakeLists.txt
 !nix/*.nix
+# Hand-authored CMake package configs live under cmake/ (e.g.
+# LogosContainerImplConfig.cmake) — the broad *.cmake above targets generated
+# files like cmake_install.cmake, not these.
+!cmake/*.cmake
 
 # Ninja
 .ninja_deps
