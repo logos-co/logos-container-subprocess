@@ -48,3 +48,10 @@ install(TARGETS logos_container_subprocess
 install(DIRECTORY src/ DESTINATION include/logos_container_subprocess
     FILES_MATCHING PATTERN "*.h"
 )
+
+# Install the generic container-implementation CMake config so consumers can
+# find_package(LogosContainerImpl) and get this container (with its own deps)
+# without naming it. See cmake/LogosContainerImplConfig.cmake.
+install(FILES cmake/LogosContainerImplConfig.cmake
+    DESTINATION lib/cmake/LogosContainerImpl
+)
