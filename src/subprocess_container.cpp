@@ -20,8 +20,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -84,6 +86,20 @@ struct ProcessEntry {
     std::string                               err_line_buf;
     std::atomic<bool>                         exited{false};
     std::atomic<bool>                         cancelled{false};
+    // Set when stdout reaches EOF, which for a dead child is the point after
+    // which no further status line can arrive. The exit verdict waits for it so
+    // a child that reports a reason and then exits is described by the reason.
+    std::atomic<bool>                         out_eof{false};
+
+    // The child's own verdict on its startup, and how a waiter in awaitLoad()
+    // hears about it. Both the status line (io thread, handleRead) and the exit
+    // (io thread, scheduleWait) settle this, so awaitLoad returns as soon as
+    // either happens rather than waiting out its deadline.
+    std::mutex                                status_mutex;
+    std::condition_variable                   status_cv;
+    std::optional<LogosCore::LoadOutcome>     status;
+    int                                       exit_code{0};
+    bool                                      exit_crashed{false};
 #ifdef _WIN32
     // Needed to ask the child to quit: see requestGracefulExit(). Zero if the
     // launcher never reported one, in which case we fall back to terminate().
@@ -163,6 +179,67 @@ IoRuntime::~IoRuntime() {
 // Async read loop
 // ---------------------------------------------------------------------------
 
+// Settle the child's load verdict, once. First writer wins: a host that reports
+// a failure and then exits should be reported by what it SAID, not by the exit
+// code that followed from it.
+void settleLoadStatus(ProcessEntry& entry, LogosCore::LoadOutcome outcome) {
+    {
+        std::lock_guard<std::mutex> lock(entry.status_mutex);
+        if (entry.status.has_value()) return;
+        entry.status = std::move(outcome);
+    }
+    entry.status_cv.notify_all();
+}
+
+// Recognise the child's status line and consume it. Returns true when the line
+// was protocol and should not be relayed as module output.
+bool consumeLoadStatusLine(ProcessEntry& entry, const std::string& line) {
+    const std::string prefix(LogosCore::kLoadStatusPrefix);
+    if (line.rfind(prefix, 0) != 0) return false;
+
+    std::string rest = line.substr(prefix.size());
+    const std::size_t start = rest.find_first_not_of(" \t");
+    rest = (start == std::string::npos) ? std::string() : rest.substr(start);
+
+    if (rest == LogosCore::kLoadStatusOk) {
+        settleLoadStatus(entry, {LogosCore::LoadVerdict::Loaded, {}});
+        return true;
+    }
+
+    const std::string failed(LogosCore::kLoadStatusFailed);
+    if (rest.rfind(failed, 0) == 0) {
+        std::string reason = rest.substr(failed.size());
+        const std::size_t r = reason.find_first_not_of(" \t");
+        reason = (r == std::string::npos) ? std::string() : reason.substr(r);
+        if (reason.empty()) reason = "the module host reported a load failure";
+        settleLoadStatus(entry, {LogosCore::LoadVerdict::Failed, std::move(reason)});
+        return true;
+    }
+
+    // Our prefix, a word we do not know: a newer host talking to an older
+    // container. Say so once rather than relaying it as module output.
+    spdlog::debug("Unrecognised load-status line from {}: {}", entry.name, line);
+    return true;
+}
+
+// Settle the exit as a failed load, once both facts are in: the child is gone
+// and its stdout is drained.
+void maybeSettleExitAsFailure(ProcessEntry& entry) {
+    if (!entry.exited.load() || !entry.out_eof.load()) return;
+
+    std::string reason;
+    if (entry.cancelled.load())
+        reason = "the module process was terminated before it reported that it had loaded";
+    else if (entry.exit_crashed)
+        reason = "the module process died on signal " + std::to_string(entry.exit_code) +
+                 " before it reported that it had loaded";
+    else
+        reason = "the module process exited with code " + std::to_string(entry.exit_code) +
+                 " before it reported that it had loaded";
+
+    settleLoadStatus(entry, {LogosCore::LoadVerdict::Failed, std::move(reason)});
+}
+
 void scheduleRead(std::shared_ptr<ProcessEntry> entry, bool isStderr);
 
 void handleRead(std::shared_ptr<ProcessEntry> entry, bool isStderr,
@@ -186,7 +263,8 @@ void handleRead(std::shared_ptr<ProcessEntry> entry, bool isStderr,
         while ((nl = line_buf.find('\n', search)) != std::string::npos) {
             std::string line = line_buf.substr(pos, nl - pos);
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (!line.empty() && entry->callbacks.onOutput)
+            if (!line.empty() && !consumeLoadStatusLine(*entry, line) &&
+                entry->callbacks.onOutput)
                 entry->callbacks.onOutput(entry->name, line, isStderr);
             pos = nl + 1;
             search = pos;
@@ -210,12 +288,17 @@ void handleRead(std::shared_ptr<ProcessEntry> entry, bool isStderr,
     if (!ec) {
         scheduleRead(std::move(entry), isStderr);
     } else {
-        if (!line_buf.empty() && entry->callbacks.onOutput) {
+        if (!line_buf.empty()) {
             if (line_buf.back() == '\r') line_buf.pop_back();
-            if (!line_buf.empty())
+            if (!line_buf.empty() && !consumeLoadStatusLine(*entry, line_buf) &&
+                entry->callbacks.onOutput)
                 entry->callbacks.onOutput(entry->name, line_buf, isStderr);
         }
         line_buf.clear();
+        if (!isStderr) {
+            entry->out_eof.store(true);
+            maybeSettleExitAsFailure(*entry);
+        }
     }
 }
 
@@ -238,17 +321,10 @@ void scheduleWait(std::shared_ptr<ProcessEntry> entry) {
     auto* e = entry.get();
     e->process.async_wait(
         [entry = std::move(entry)](const boost::system::error_code& /*ec*/, int raw_status) mutable {
-            entry->exited.store(true);
-
             std::string name = entry->name;
             bool was_cancelled = entry->cancelled.load();
 
             {
-                std::lock_guard<std::mutex> lock(s_processesMutex);
-                s_processes.erase(name);
-            }
-
-            if (!was_cancelled && entry->callbacks.onFinished) {
                 bool crashed = false;
                 int exit_code = raw_status;
 #if defined(WIFEXITED)
@@ -286,8 +362,21 @@ void scheduleWait(std::shared_ptr<ProcessEntry> entry) {
                         break;
                 }
 #endif
-                entry->callbacks.onFinished(name, exit_code, crashed);
+                // Recorded before `exited`, so a waiter that wakes on it reads a
+                // settled exit code rather than a zero-initialised one.
+                entry->exit_code    = exit_code;
+                entry->exit_crashed = crashed;
+                entry->exited.store(true);
+                maybeSettleExitAsFailure(*entry);
             }
+
+            {
+                std::lock_guard<std::mutex> lock(s_processesMutex);
+                s_processes.erase(name);
+            }
+
+            if (!was_cancelled && entry->callbacks.onFinished)
+                entry->callbacks.onFinished(name, entry->exit_code, entry->exit_crashed);
         });
 }
 
@@ -512,6 +601,36 @@ bool SubprocessContainer::launch(const LogosCore::ModuleDescriptor& desc,
 bool SubprocessContainer::sendToken(const std::string& name, const std::string& token)
 {
     return sendTokenToProcess(name, token);
+}
+
+LogosCore::LoadOutcome SubprocessContainer::awaitLoad(const std::string& name,
+                                                      std::chrono::milliseconds timeout)
+{
+    std::shared_ptr<ProcessEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(s_processesMutex);
+        auto it = s_processes.find(name);
+        if (it != s_processes.end())
+            entry = it->second;
+    }
+
+    // The entry is erased when the child dies, so its absence here means the
+    // process is already gone -- whatever else is true, the module is not there.
+    if (!entry)
+        return {LogosCore::LoadVerdict::Failed,
+                "the module process exited before it reported that it had loaded"};
+
+    // The entry outlives its removal from s_processes through this shared_ptr,
+    // so a verdict that settles while we wait still reaches us.
+    std::unique_lock<std::mutex> lock(entry->status_mutex);
+    entry->status_cv.wait_for(lock, timeout,
+                              [&entry] { return entry->status.has_value(); });
+    if (entry->status)
+        return *entry->status;
+
+    // Alive and silent: a host too old to report, or one still starting. Not
+    // evidence of failure.
+    return {};
 }
 
 void SubprocessContainer::terminate(const std::string& name)

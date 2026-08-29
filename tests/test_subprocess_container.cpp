@@ -395,3 +395,118 @@ TEST_F(SubprocessContainerTest, Terminate_NoopForUnknown) {
     container.terminate("nonexistent");
     SUCCEED();
 }
+
+// ---------------------------------------------------------------------------
+// awaitLoad: the child's own verdict on whether its plugin loaded
+//
+// launch() answers "spawned". These cover the fact it cannot reach: what the
+// child then did. A verdict must arrive as soon as the child settles it, so
+// each of these asserts on elapsed time too -- a deadline reached is the one
+// answer that means "nothing was learned", and it must not be reachable by a
+// child that already spoke or already died.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+LogosCore::LoadOutcome awaitAfterLaunch(SubprocessContainer& c, const char* name,
+                                        const std::string& script,
+                                        std::chrono::milliseconds timeout,
+                                        std::chrono::milliseconds& elapsed) {
+    LogosCore::ModuleDescriptor desc;
+    desc.name = name;
+    LogosCore::LoadedModuleHandle handle;
+    if (!c.launch(desc, "/bin/sh", {"-c", script}, nullptr, handle))
+        return {LogosCore::LoadVerdict::Failed, "launch failed"};
+
+    const auto start = std::chrono::steady_clock::now();
+    LogosCore::LoadOutcome out = c.awaitLoad(name, timeout);
+    elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    return out;
+}
+
+} // namespace
+
+TEST_F(SubprocessContainerTest, AwaitLoad_ReportsLoadedWhenTheChildSaysSo) {
+    std::chrono::milliseconds elapsed{};
+    const auto out = awaitAfterLaunch(
+        container, "ok_mod",
+        "printf '%s\\n' '@logos-load-status ok'; exec sleep 5",
+        std::chrono::seconds(5), elapsed);
+
+    EXPECT_EQ(out.verdict, LogosCore::LoadVerdict::Loaded);
+    EXPECT_LT(elapsed, std::chrono::seconds(4));
+}
+
+TEST_F(SubprocessContainerTest, AwaitLoad_CarriesTheReasonTheChildReported) {
+    std::chrono::milliseconds elapsed{};
+    const auto out = awaitAfterLaunch(
+        container, "failed_mod",
+        "printf '%s\\n' '@logos-load-status failed undefined symbol: logos_module_install'; exit 1",
+        std::chrono::seconds(5), elapsed);
+
+    EXPECT_EQ(out.verdict, LogosCore::LoadVerdict::Failed);
+    EXPECT_NE(out.reason.find("undefined symbol: logos_module_install"),
+              std::string::npos);
+    EXPECT_LT(elapsed, std::chrono::seconds(4));
+}
+
+// A child that dies without a word is still a failed load, and the exit code is
+// the only reason available to describe it.
+TEST_F(SubprocessContainerTest, AwaitLoad_ReportsFailureWhenTheChildJustDies) {
+    std::chrono::milliseconds elapsed{};
+    const auto out = awaitAfterLaunch(container, "dead_mod", "exit 3",
+                                      std::chrono::seconds(5), elapsed);
+
+    EXPECT_EQ(out.verdict, LogosCore::LoadVerdict::Failed);
+    EXPECT_NE(out.reason.find("3"), std::string::npos);
+    EXPECT_LT(elapsed, std::chrono::seconds(4));
+}
+
+// Alive and silent at the deadline is not evidence of failure: it is what a
+// module host too old to report the line looks like.
+TEST_F(SubprocessContainerTest, AwaitLoad_ReportsUnknownForASilentLiveChild) {
+    std::chrono::milliseconds elapsed{};
+    const auto out = awaitAfterLaunch(container, "silent_mod", "exec sleep 5",
+                                      std::chrono::milliseconds(300), elapsed);
+
+    EXPECT_EQ(out.verdict, LogosCore::LoadVerdict::Unknown);
+    EXPECT_TRUE(out.reason.empty());
+    EXPECT_GE(elapsed, std::chrono::milliseconds(250));
+}
+
+TEST_F(SubprocessContainerTest, AwaitLoad_ReportsFailureForAModuleThatWasNeverLaunched) {
+    const auto out = container.awaitLoad("never_launched", std::chrono::milliseconds(10));
+    EXPECT_EQ(out.verdict, LogosCore::LoadVerdict::Failed);
+    EXPECT_FALSE(out.reason.empty());
+}
+
+// The status line is protocol, not module output: relaying it would put it in
+// the module's log stream on every single load.
+TEST_F(SubprocessContainerTest, AwaitLoad_StatusLineIsNotRelayedAsModuleOutput) {
+    std::mutex m;
+    std::vector<std::string> lines;
+    SubprocessContainer::ProcessCallbacks cbs;
+    cbs.onOutput = [&](const std::string&, const std::string& line, bool) {
+        std::lock_guard<std::mutex> g(m);
+        lines.push_back(line);
+    };
+
+    ASSERT_TRUE(SubprocessContainer::startProcess(
+        "quiet_mod", "/bin/sh",
+        {"-c", "printf '%s\\n' '@logos-load-status ok' 'hello'; exec sleep 5"}, cbs));
+
+    const auto out = container.awaitLoad("quiet_mod", std::chrono::seconds(5));
+    ASSERT_EQ(out.verdict, LogosCore::LoadVerdict::Loaded);
+
+    // The plain line still has to get through; only the protocol one is eaten.
+    for (int i = 0; i < 100; ++i) {
+        {
+            std::lock_guard<std::mutex> g(m);
+            if (!lines.empty()) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    std::lock_guard<std::mutex> g(m);
+    EXPECT_EQ(lines, std::vector<std::string>{"hello"});
+}
