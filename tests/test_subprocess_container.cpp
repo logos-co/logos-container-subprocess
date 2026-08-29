@@ -331,6 +331,43 @@ TEST_F(SubprocessContainerTest, Launch_OnFinishedReportsCrashedOnSignal) {
     EXPECT_FALSE(container.pid("crash_test").has_value());
 }
 
+// The other half of the same contract, and the one nothing covered: a child
+// that EXITS must not be described as one that was signalled. Boost.Process v2
+// hands async_wait an exit code that is already evaluated -- WEXITSTATUS for an
+// exit, WTERMSIG for a signal -- so re-decoding it as a wait status makes every
+// exit code from 1..126 look like a fatal signal. The signal test above passes
+// either way (WTERMSIG(11) == 11), which is why this went unseen; the daemon
+// meanwhile logged "Module process crashed" for a module host that exited 1
+// because its plugin would not load.
+TEST_F(SubprocessContainerTest, Launch_OnFinishedReportsPlainExitAsNotCrashed) {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::atomic<bool> fired{false};
+    int gotExitCode = -1;
+    bool gotCrashed = true;
+
+    SubprocessContainer::ProcessCallbacks cb;
+    cb.onFinished = [&](const std::string&, int code, bool crashed) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            gotExitCode = code;
+            gotCrashed = crashed;
+        }
+        fired.store(true);
+        cv.notify_all();
+    };
+
+    ASSERT_TRUE(SubprocessContainer::startProcess(
+        "exit_test", "/bin/sh", {"-c", "exit 3"}, cb));
+
+    std::unique_lock<std::mutex> lock(mtx);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
+                            [&]() { return fired.load(); }));
+
+    EXPECT_FALSE(gotCrashed);
+    EXPECT_EQ(gotExitCode, 3);
+}
+
 // ---------------------------------------------------------------------------
 // Token delivery over the child's stdin pipe
 //

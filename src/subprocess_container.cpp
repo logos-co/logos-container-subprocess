@@ -326,13 +326,21 @@ void scheduleWait(std::shared_ptr<ProcessEntry> entry) {
 
             {
                 bool crashed = false;
+                // async_wait's int is ALREADY evaluated (boost/process/v2/
+                // exit_code.hpp): WEXITSTATUS for an exit, WTERMSIG for a
+                // signal, with nothing left to say which it was. Re-decoding it
+                // as a wait status made every exit code in 1..126 look like a
+                // fatal signal -- so a module host exiting 1 because its plugin
+                // would not load was logged as a crash. The raw status is still
+                // on the handle, and it is what distinguishes the two.
                 int exit_code = raw_status;
 #if defined(WIFEXITED)
-                if (WIFSIGNALED(raw_status)) {
+                const auto native = entry->process.native_exit_code();
+                if (WIFSIGNALED(native)) {
                     crashed    = true;
-                    exit_code  = WTERMSIG(raw_status);
-                } else if (WIFEXITED(raw_status)) {
-                    exit_code = WEXITSTATUS(raw_status);
+                    exit_code  = WTERMSIG(native);
+                } else if (WIFEXITED(native)) {
+                    exit_code = WEXITSTATUS(native);
                 }
 #elif defined(_WIN32)
                 // Windows has no wait-status encoding: the raw value IS the
