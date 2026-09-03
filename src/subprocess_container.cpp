@@ -14,6 +14,21 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <dirent.h>
+#include <fcntl.h>
+#include <spawn.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstdlib>
+// environ is declared by <unistd.h> on glibc and musl but NOT on Apple, so it
+// is declared here -- at file scope, where there can only be one of it.
+extern "C" char** environ;
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 34)
+#define LOGOS_HAVE_CLOSEFROM_NP 1
+#endif
+#endif
 #endif
 #include <spdlog/sinks/stdout_color_sinks.h>
 
@@ -388,6 +403,144 @@ void scheduleWait(std::shared_ptr<ProcessEntry> entry) {
         });
 }
 
+#ifndef _WIN32
+// ---------------------------------------------------------------------------
+// POSIX child-process plumbing
+//
+// WHY NOT bp2's LAUNCHER. Its POSIX default forks, and the FORKED CHILD calls
+// ctx.notify_fork(fork_child) before execve. That walks every asio service
+// taking their locks -- service_registry::mutex_, which every pipe
+// construction on this context also takes, and the reactor's descriptor mutex,
+// which pipe teardown takes on the io thread. A lock held by any other thread
+// at fork time is inherited locked with no owner, so the child blocks forever
+// before exec while the parent blocks forever on an untimed exec-status pipe
+// read. Measured: a 6 h CI hang, leaving a live single-threaded never-exec'd
+// child. Serializing spawns does not fix it -- the io thread is a second
+// thread and takes the reactor mutex on every module exit.
+//
+// posix_spawn runs NO user code between fork and exec: the file actions are
+// declarative and libc performs them with async-signal-safe calls only.
+// Not vfork -- on macOS that has been plain fork since 12.0, so the child's
+// error write is invisible to the parent and a failed exec reports SUCCESS.
+// ---------------------------------------------------------------------------
+
+// Everything above stderr that is not this child's own stdio. bp2's launcher
+// did this unconditionally in the forked child; posix_spawn does not, so it is
+// spelled out here -- best mechanism first, because glibc only grew
+// addclosefrom_np in 2.34 and Ubuntu 20.04 and RHEL 8 are older than that.
+int addCloseForeignFds(posix_spawn_file_actions_t& fa, int a, int b, int c)
+{
+#if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+    (void)fa; (void)a; (void)b; (void)c;
+    return 0;                                   // the attr flag covers it
+#elif defined(LOGOS_HAVE_CLOSEFROM_NP)
+    (void)a; (void)b; (void)c;
+    return ::posix_spawn_file_actions_addclosefrom_np(&fa, STDERR_FILENO + 1);
+#else
+    // Enumerate. A descriptor opened after this races and is missed -- the same
+    // race bp2's own /proc walk had.
+    DIR* d = ::opendir("/proc/self/fd");
+    if (d == nullptr) d = ::opendir("/dev/fd");
+    if (d != nullptr) {
+        const int dfd = ::dirfd(d);
+        int e = 0;
+        while (const dirent* ent = ::readdir(d)) {
+            const int fd = ::atoi(ent->d_name);
+            if (fd <= STDERR_FILENO || fd == dfd || fd == a || fd == b || fd == c)
+                continue;
+            e = ::posix_spawn_file_actions_addclose(&fa, fd);
+            if (e) break;
+        }
+        ::closedir(d);
+        return e;
+    }
+    const long lim = ::sysconf(_SC_OPEN_MAX);
+    const int  top = lim > 0 ? static_cast<int>(lim) : 1024;
+    for (int fd = STDERR_FILENO + 1; fd < top; ++fd) {
+        if (fd == a || fd == b || fd == c || ::fcntl(fd, F_GETFD) == -1) continue;
+        if (const int e = ::posix_spawn_file_actions_addclose(&fa, fd)) return e;
+    }
+    return 0;
+#endif
+}
+
+// Returns 0, or an errno.
+int spawnChild(const std::string& executable,
+               const std::vector<std::string>& arguments,
+               int child_in, int child_out, int child_err,
+               pid_t& out_pid)
+{
+    // File actions run in order, so a source that is already 0/1/2 would be
+    // clobbered by an earlier dup2. Our pipes are always above stderr; refuse
+    // loudly rather than silently crossing a module's streams.
+    if (child_in <= STDERR_FILENO || child_out <= STDERR_FILENO ||
+        child_err <= STDERR_FILENO) {
+        spdlog::error("Refusing to spawn {}: a pipe landed on fd {}/{}/{}, which "
+                      "means this process was started with stdio closed",
+                      executable, child_in, child_out, child_err);
+        return EBADF;
+    }
+
+    posix_spawn_file_actions_t fa;
+    if (int e = ::posix_spawn_file_actions_init(&fa)) return e;
+    posix_spawnattr_t attr;
+    if (int e = ::posix_spawnattr_init(&attr)) {
+        ::posix_spawn_file_actions_destroy(&fa);
+        return e;
+    }
+
+    int e = 0;
+    // dup2 clears FD_CLOEXEC on the TARGET, which is what lets these three
+    // survive exec while their close-on-exec originals do not.
+    if (!e) e = ::posix_spawn_file_actions_adddup2(&fa, child_in,  STDIN_FILENO);
+    if (!e) e = ::posix_spawn_file_actions_adddup2(&fa, child_out, STDOUT_FILENO);
+    if (!e) e = ::posix_spawn_file_actions_adddup2(&fa, child_err, STDERR_FILENO);
+    // Foreign descriptors -- Qt's, the embedding app's -- which we did not open
+    // and cannot mark close-on-exec ourselves.
+    if (!e) e = addCloseForeignFds(fa, child_in, child_out, child_err);
+#if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+    if (!e) e = ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+#endif
+
+    if (!e) {
+        std::vector<char*> argv;
+        argv.reserve(arguments.size() + 2);
+        // argv[0] is the executable path, as bp2's launcher sets it.
+        argv.push_back(const_cast<char*>(executable.c_str()));
+        for (const auto& a : arguments) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+
+        // posix_spawn, not posix_spawnp: bp2 used execve, so no PATH search.
+        pid_t pid = -1;
+        e = ::posix_spawn(&pid, executable.c_str(), &fa, &attr, argv.data(), environ);
+        if (!e) out_pid = pid;
+    }
+
+    ::posix_spawnattr_destroy(&attr);
+    ::posix_spawn_file_actions_destroy(&fa);
+    return e;
+}
+
+// Our own pipe ends must not reach a child. asio::connect_pipe does not mark
+// them (boost/asio/impl/connect_pipe.ipp is a bare ::pipe), and a child that
+// inherits a SIBLING's ends never lets that module's stdout reach EOF, so its
+// exit is never settled and awaitLoad returns a vacuously wrong verdict, while
+// its stdin read end stays open and it waits for a token that cannot arrive.
+//
+// Belt to addCloseForeignFds' braces: that enumerates at spawn time and so
+// cannot see a pipe created moments later by another thread; this marks ours at
+// birth. Neither alone covers both directions.
+bool markCloexec(std::initializer_list<int> fds)
+{
+    for (int fd : fds) {
+        const int flags = ::fcntl(fd, F_GETFD);
+        if (flags == -1 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1)
+            return false;
+    }
+    return true;
+}
+#endif  // !_WIN32
+
 #ifdef _WIN32
 // ---------------------------------------------------------------------------
 // Windows child-process plumbing
@@ -710,12 +863,12 @@ bool SubprocessContainer::startProcess(const std::string& name, const std::strin
         return false;
     }
 
+#ifdef _WIN32
     bp2::process_stdio pstdio;
     pstdio.in  = in_rpipe;
     pstdio.out = out_wpipe;
     pstdio.err = err_wpipe;
 
-#ifdef _WIN32
     // The extra initializer assigns the child to the container job and hands
     // back its main thread id, which is what makes a graceful stop possible
     // (see the WindowsChildSetup comment).
@@ -724,7 +877,27 @@ bool SubprocessContainer::startProcess(const std::string& name, const std::strin
         rt.ctx, ec, executable, arguments, pstdio,
         WindowsChildSetup{&childMainThread});
 #else
-    bp2::process proc = bp2::default_process_launcher()(rt.ctx, ec, executable, arguments, pstdio);
+    // Only the three the child inherits as its stdio survive exec, and only
+    // because dup2 clears the flag on the target.
+    if (!markCloexec({out_rpipe.native_handle(), out_wpipe.native_handle(),
+                      err_rpipe.native_handle(), err_wpipe.native_handle(),
+                      in_rpipe.native_handle(),  in_wpipe.native_handle()})) {
+        spdlog::error("Failed to mark pipes close-on-exec for {}: {}", name,
+                      boost::system::error_code(errno, boost::system::system_category()).message());
+        return false;
+    }
+
+    pid_t child = -1;
+    if (const int e = spawnChild(executable, arguments,
+                                 in_rpipe.native_handle(),
+                                 out_wpipe.native_handle(),
+                                 err_wpipe.native_handle(), child)) {
+        spdlog::error("Failed to start process for {}: {}", name,
+                      boost::system::error_code(e, boost::system::system_category()).message());
+        return false;
+    }
+    // The attach bp2's own launcher ends with, so nothing downstream differs.
+    bp2::process proc(rt.ctx.get_executor(), child);
 #endif
 
     out_wpipe.close();

@@ -19,13 +19,31 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#ifndef _WIN32
+#include <cerrno>
+#include <future>
+#include <pthread.h>
+#include <unistd.h>
+#endif
+
+#ifndef _WIN32
+// Defined with the fork tests at the end of this file. Declared here because
+// the fixture disarms the trap unconditionally: a test that fails between
+// arming and releasing must not leave it armed for the next one.
+void disarmAtforkTrap();
+#endif
 
 class SubprocessContainerTest : public ::testing::Test {
 protected:
     SubprocessContainer container;
 
     void SetUp() override { SubprocessContainer::clearAll(); }
-    void TearDown() override { SubprocessContainer::clearAll(); }
+    void TearDown() override {
+        SubprocessContainer::clearAll();
+#ifndef _WIN32
+        disarmAtforkTrap();   // never leave it armed for the next test
+#endif
+    }
 };
 
 // Launch a fake module host under `name` that stays alive ~5s. It must tolerate
@@ -547,3 +565,134 @@ TEST_F(SubprocessContainerTest, AwaitLoad_StatusLineIsNotRelayedAsModuleOutput) 
     std::lock_guard<std::mutex> g(m);
     EXPECT_EQ(lines, std::vector<std::string>{"hello"});
 }
+
+#ifndef _WIN32
+// ---------------------------------------------------------------------------
+// The launcher must not fork()
+//
+// A forked child inherits asio's locks with no owner and wedges before execve,
+// while the parent blocks on an untimed exec-status read -- see spawnChild.
+// These two assert that, the first on the mechanism and the second on the
+// symptom, both deterministically: pthread_atfork handlers run for fork() and
+// are NOT run for posix_spawn.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::atomic<int>  g_atfork_prepare{0};
+std::atomic<int>  g_atfork_parent{0};
+std::atomic<bool> g_trap_armed{false};
+std::atomic<int>  g_trap_fd{-1};
+
+void onAtforkPrepare() { g_atfork_prepare.fetch_add(1); }
+void onAtforkParent()  { g_atfork_parent.fetch_add(1); }
+
+// Stands in for any lock inherited in the locked state: same window, timing
+// made certain. read() is async-signal-safe, so this is legal in a child
+// handler in a way that taking a mutex would not be.
+void onAtforkChild()
+{
+    if (!g_trap_armed.load()) return;
+    char c = 0;
+    while (::read(g_trap_fd.load(), &c, 1) == -1 && errno == EINTR) {}
+}
+
+}  // namespace
+
+void disarmAtforkTrap() { g_trap_armed.store(false); }
+
+namespace {
+
+// pthread_atfork handlers cannot be unregistered, hence the armed flag.
+int ensureAtforkHandlers()
+{
+    static const int rc =
+        ::pthread_atfork(&onAtforkPrepare, &onAtforkParent, &onAtforkChild);
+    return rc;
+}
+
+}  // namespace
+
+// This encodes an opinion worth stating out loud: a fix that keeps fork() and
+// merely puts a deadline on the exec-status read would fail here. That is
+// intended -- a deadline turns a hang into a spurious launch failure plus a
+// wedged child that nobody reaps.
+TEST_F(SubprocessContainerTest, Launch_DoesNotFork) {
+    ASSERT_EQ(ensureAtforkHandlers(), 0)
+        << "pthread_atfork registration failed; this test would pass vacuously";
+
+    // Positive control: without it, a handler that never runs is
+    // indistinguishable from a launcher that never forks.
+    g_atfork_prepare.store(0);
+    const pid_t control = ::fork();
+    if (control == 0) ::_exit(0);
+    ASSERT_GT(control, 0);
+    ::waitpid(control, nullptr, 0);
+    ASSERT_EQ(g_atfork_prepare.load(), 1) << "the handlers are not live";
+
+    g_atfork_prepare.store(0);
+    g_atfork_parent.store(0);
+
+    LogosCore::LoadedModuleHandle handle;
+    ASSERT_TRUE(launchFakeModule(container, "no_fork", handle));
+
+    EXPECT_EQ(g_atfork_prepare.load(), 0)
+        << "the launcher forked; a forked child inherits asio's service and "
+           "reactor mutexes locked with no owner and can never reach execve";
+    EXPECT_EQ(g_atfork_parent.load(), 0);
+}
+
+// The symptom: a child wedged before exec must not hang the parent. Under a
+// forking launcher this never returns; the 5 s bound is ~1000x a healthy
+// launch, so it cannot flake.
+TEST_F(SubprocessContainerTest, Launch_DoesNotBlockOnAWedgedChild) {
+    ensureAtforkHandlers();
+
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(::pipe(fds), 0);
+    g_trap_fd.store(fds[0]);
+    g_trap_armed.store(true);
+
+    // shared_ptr so a detached worker on the failure path cannot dangle.
+    auto done = std::make_shared<std::promise<bool>>();
+    auto fut = done->get_future();
+    std::thread worker([this, done] {
+        LogosCore::LoadedModuleHandle handle;
+        try {
+            done->set_value(launchFakeModule(container, "wedged", handle));
+        } catch (...) {
+            done->set_exception(std::current_exception());
+        }
+    });
+
+    const bool returned = fut.wait_for(std::chrono::seconds(5)) ==
+                          std::future_status::ready;
+
+    // Release BEFORE asserting, so a red run frees its child rather than
+    // leaving one wedged for the rest of the suite.
+    g_trap_armed.store(false);
+    const ssize_t released = ::write(fds[1], "x", 1);
+    EXPECT_EQ(released, 1);
+
+    // Bounded: the byte above only frees a child blocked in onAtforkChild, and
+    // an unbounded join on any other wedge would hang the whole run with no
+    // output.
+    if (returned || fut.wait_for(std::chrono::seconds(5)) ==
+                        std::future_status::ready) {
+        worker.join();
+    } else {
+        worker.detach();
+    }
+    ::close(fds[0]);
+    ::close(fds[1]);
+    g_trap_fd.store(-1);
+
+    ASSERT_TRUE(returned)
+        << "launch() did not return within 5s: the launcher forked, the child "
+           "wedged before execve, and the parent is on an untimed read of the "
+           "exec-status pipe";
+    // Otherwise a launch that failed outright would satisfy the timing bound.
+    EXPECT_TRUE(fut.get()) << "launch returned quickly because it FAILED, so "
+                              "the timing assertion above proved nothing";
+}
+#endif  // !_WIN32
