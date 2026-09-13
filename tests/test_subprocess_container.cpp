@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -23,6 +24,7 @@
 #include <cerrno>
 #include <future>
 #include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
 #endif
 
@@ -696,3 +698,111 @@ TEST_F(SubprocessContainerTest, Launch_DoesNotBlockOnAWedgedChild) {
                               "the timing assertion above proved nothing";
 }
 #endif  // !_WIN32
+
+#ifdef __linux__
+// ---------------------------------------------------------------------------
+// Which thread a child is launched from must not change the child
+//
+// Module hosts arm PR_SET_PDEATHSIG, which Linux fires when the THREAD that
+// spawned them exits, not the process. setpriv arms it the same way here.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Shared with the callbacks, which the io thread can still call after a failed
+// assertion has unwound the test body.
+struct ChildLines {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<std::string> lines;
+    bool finished = false;
+
+    // The first line starting with `prefix`, or "" if none arrives in time. Not
+    // cut short by `finished`: the exit can be reported before the last line.
+    std::string waitForLine(const std::string& prefix, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mtx);
+        std::string found;
+        cv.wait_for(lock, timeout, [&] {
+            for (const auto& l : lines)
+                if (l.rfind(prefix, 0) == 0) { found = l; return true; }
+            return false;
+        });
+        return found;
+    }
+};
+
+SubprocessContainer::ProcessCallbacks recordInto(const std::shared_ptr<ChildLines>& child) {
+    SubprocessContainer::ProcessCallbacks cb;
+    cb.onOutput = [child](const std::string&, const std::string& line, bool) {
+        std::lock_guard<std::mutex> lock(child->mtx);
+        child->lines.push_back(line);
+        child->cv.notify_all();
+    };
+    cb.onFinished = [child](const std::string&, int, bool) {
+        std::lock_guard<std::mutex> lock(child->mtx);
+        child->finished = true;
+        child->cv.notify_all();
+    };
+    return cb;
+}
+
+}  // namespace
+
+TEST_F(SubprocessContainerTest, Launch_ChildOutlivesTheThreadThatLaunchedIt) {
+    auto child = std::make_shared<ChildLines>();
+
+    // The launcher waits for the child to arm the signal before exiting, so a
+    // child that dies with it dies every time rather than on a lost race.
+    std::string armed;
+    std::thread launcher([&] {
+        ASSERT_TRUE(SubprocessContainer::startProcess(
+            "pdeathsig", "/bin/sh",
+            {"-c", "exec setpriv --pdeathsig KILL sh -c 'echo armed; exec sleep 30'"},
+            recordInto(child)));
+        armed = child->waitForLine("armed", std::chrono::seconds(5));
+    });
+    launcher.join();
+    ASSERT_EQ(armed, "armed") << "the child never armed PR_SET_PDEATHSIG; is setpriv on PATH?";
+
+    {
+        std::unique_lock<std::mutex> lock(child->mtx);
+        EXPECT_FALSE(child->cv.wait_for(lock, std::chrono::seconds(1),
+                                        [&] { return child->finished; }))
+            << "the child was killed when the thread that launched it exited";
+    }
+    const int64_t pid = SubprocessContainer::getProcessId("pdeathsig");
+    ASSERT_GT(pid, 0);
+    EXPECT_EQ(::kill(static_cast<pid_t>(pid), 0), 0);
+}
+
+// posix_spawn gives a child the signal mask of the thread that calls it. SIGUSR2
+// is set explicitly both ways, so a launcher that spawns from some other
+// thread cannot pass by inheriting that thread's mask.
+TEST_F(SubprocessContainerTest, Launch_ChildStartsWithTheCallersSignalMask) {
+    const unsigned long long usr2 = 1ULL << (SIGUSR2 - 1);
+
+    auto childMaskFromCaller = [](const char* name, int how) -> std::string {
+        std::string sigblk;
+        std::thread caller([&] {
+            sigset_t set;
+            sigemptyset(&set);
+            sigaddset(&set, SIGUSR2);
+            ASSERT_EQ(::pthread_sigmask(how, &set, nullptr), 0);
+            auto child = std::make_shared<ChildLines>();
+            ASSERT_TRUE(SubprocessContainer::startProcess(
+                name, "/bin/sh", {"-c", "exec grep SigBlk /proc/self/status"},
+                recordInto(child)));
+            sigblk = child->waitForLine("SigBlk:", std::chrono::seconds(5));
+        });
+        caller.join();
+        return sigblk;
+    };
+
+    const std::string blocked = childMaskFromCaller("sigmask_blocked", SIG_BLOCK);
+    const std::string unblocked = childMaskFromCaller("sigmask_unblocked", SIG_UNBLOCK);
+    ASSERT_FALSE(blocked.empty());
+    ASSERT_FALSE(unblocked.empty());
+    EXPECT_NE(std::stoull(blocked.substr(7), nullptr, 16) & usr2, 0u) << blocked;
+    EXPECT_EQ(std::stoull(unblocked.substr(7), nullptr, 16) & usr2, 0u) << unblocked;
+}
+#endif  // __linux__

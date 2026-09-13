@@ -69,7 +69,9 @@
         {
           tests = pkgs.runCommand "logos-container-subprocess-tests"
             {
-              nativeBuildInputs = [ testsPkg ];
+              nativeBuildInputs = [ testsPkg ]
+                # setpriv, which the PR_SET_PDEATHSIG test's child runs under.
+                ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.util-linux ];
             } ''
             echo "Running logos-container-subprocess tests..."
             ${testsPkg}/bin/logos_container_subprocess_tests
