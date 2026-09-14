@@ -17,10 +17,13 @@
 #else
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstdlib>
+#include <future>
 // environ is declared by <unistd.h> on glibc and musl but NOT on Apple, so it
 // is declared here -- at file scope, where there can only be one of it.
 extern "C" char** environ;
@@ -78,6 +81,34 @@ IoRuntime& ioRuntime() {
     static IoRuntime s_runtime;
     return s_runtime;
 }
+
+#ifndef _WIN32
+// ---------------------------------------------------------------------------
+// Spawn thread: every POSIX child is launched from this one thread.
+//
+// Module hosts arm PR_SET_PDEATHSIG, which Linux sends when the THREAD that
+// spawned them exits, so launching from a short-lived caller thread would kill
+// the host along with it. Leaked and never joined: hosts still go down only
+// with the process. Not the io thread: it runs embedder callbacks, and a spawn
+// must never wait behind one.
+// ---------------------------------------------------------------------------
+
+struct SpawnRuntime {
+    asio::io_context ctx;
+    asio::executor_work_guard<asio::io_context::executor_type> guard;
+    std::thread thread;
+
+    SpawnRuntime()
+        : guard(asio::make_work_guard(ctx))
+        , thread([this]() { ctx.run(); })
+    {}
+};
+
+SpawnRuntime& spawnRuntime() {
+    static SpawnRuntime* s_runtime = new SpawnRuntime;
+    return *s_runtime;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // ProcessEntry: owns one live child process and its read pipes.
@@ -468,7 +499,7 @@ int addCloseForeignFds(posix_spawn_file_actions_t& fa, int a, int b, int c)
 int spawnChild(const std::string& executable,
                const std::vector<std::string>& arguments,
                int child_in, int child_out, int child_err,
-               pid_t& out_pid)
+               const sigset_t& sigmask, pid_t& out_pid)
 {
     // File actions run in order, so a source that is already 0/1/2 would be
     // clobbered by an earlier dup2. Our pipes are always above stderr; refuse
@@ -498,9 +529,12 @@ int spawnChild(const std::string& executable,
     // Foreign descriptors -- Qt's, the embedding app's -- which we did not open
     // and cannot mark close-on-exec ourselves.
     if (!e) e = addCloseForeignFds(fa, child_in, child_out, child_err);
+    short flags = POSIX_SPAWN_SETSIGMASK;
 #if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
-    if (!e) e = ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
 #endif
+    if (!e) e = ::posix_spawnattr_setsigmask(&attr, &sigmask);
+    if (!e) e = ::posix_spawnattr_setflags(&attr, flags);
 
     if (!e) {
         std::vector<char*> argv;
@@ -519,6 +553,26 @@ int spawnChild(const std::string& executable,
     ::posix_spawnattr_destroy(&attr);
     ::posix_spawn_file_actions_destroy(&fa);
     return e;
+}
+
+// Returns 0, or an errno. Spawns on the spawn thread (see SpawnRuntime) while
+// giving the child this thread's signal mask, which it would otherwise inherit
+// from the spawn thread.
+int spawnFromSpawnThread(const std::string& executable,
+                         const std::vector<std::string>& arguments,
+                         int child_in, int child_out, int child_err,
+                         pid_t& out_pid)
+{
+    sigset_t sigmask;
+    if (const int e = ::pthread_sigmask(SIG_SETMASK, nullptr, &sigmask)) return e;
+
+    std::packaged_task<int()> spawn([&]() {
+        return spawnChild(executable, arguments, child_in, child_out, child_err,
+                          sigmask, out_pid);
+    });
+    std::future<int> result = spawn.get_future();
+    asio::post(spawnRuntime().ctx, std::move(spawn));
+    return result.get();
 }
 
 // Our own pipe ends must not reach a child. asio::connect_pipe does not mark
@@ -893,10 +947,10 @@ bool SubprocessContainer::startProcess(const std::string& name, const std::strin
     }
 
     pid_t child = -1;
-    if (const int e = spawnChild(executable, arguments,
-                                 in_rpipe.native_handle(),
-                                 out_wpipe.native_handle(),
-                                 err_wpipe.native_handle(), child)) {
+    if (const int e = spawnFromSpawnThread(executable, arguments,
+                                           in_rpipe.native_handle(),
+                                           out_wpipe.native_handle(),
+                                           err_wpipe.native_handle(), child)) {
         spdlog::error("Failed to start process for {}: {}", name,
                       boost::system::error_code(e, boost::system::system_category()).message());
         return false;
