@@ -704,14 +704,18 @@ void syncKill(std::shared_ptr<ProcessEntry> entry) {
     // windowless QCoreApplication never receives -- it would silently succeed
     // and do nothing, costing the full grace period per module. WM_QUIT to the
     // main thread is what Qt actually turns into QCoreApplication::quit().
-    if (entry->main_thread_id != 0) {
-        if (!::PostThreadMessageW(entry->main_thread_id, WM_QUIT, 0, 0))
-            spdlog::warn("PostThreadMessage(WM_QUIT) failed for {} ({}); "
-                         "falling back to terminate", entry->name, ::GetLastError());
-    } else {
+    // It cannot be posted before that thread has a message queue, which a child
+    // stopped while still starting may not have yet: keep posting until it lands.
+    DWORD postError = 0;
+    auto postQuit = [&]() {
+        if (::PostThreadMessageW(entry->main_thread_id, WM_QUIT, 0, 0)) return true;
+        postError = ::GetLastError();
+        return false;
+    };
+    bool quitPosted = entry->main_thread_id != 0 && postQuit();
+    if (entry->main_thread_id == 0)
         spdlog::warn("No main thread id recorded for {}; cannot request a "
                      "graceful exit, will terminate", entry->name);
-    }
 #else
     entry->process.request_exit(ec);
 #endif
@@ -720,12 +724,20 @@ void syncKill(std::shared_ptr<ProcessEntry> entry) {
         auto deadline = std::chrono::steady_clock::now() + budget;
         while (!entry->exited.load()) {
             if (std::chrono::steady_clock::now() >= deadline) return false;
+#ifdef _WIN32
+            if (!quitPosted && entry->main_thread_id != 0) quitPosted = postQuit();
+#endif
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         return true;
     };
 
     if (!wait(std::chrono::seconds(5))) {
+#ifdef _WIN32
+        if (!quitPosted)
+            spdlog::warn("PostThreadMessage(WM_QUIT) never reached {} ({})",
+                         entry->name, postError);
+#endif
         spdlog::warn("Process did not terminate gracefully, killing: {}",
                                     entry->name);
         entry->process.terminate(ec);
