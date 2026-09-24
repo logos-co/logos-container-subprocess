@@ -44,7 +44,9 @@
 
           lib = import ./nix/lib.nix { inherit pkgs common build; };
           include = import ./nix/include.nix { inherit pkgs common src; };
-          tests = import ./nix/tests.nix { inherit pkgs common build logosContainer; };
+          tests = if pkgs.stdenv.hostPlatform.isWindows
+            then import ./nix/tests-windows.nix { inherit pkgs common src; }
+            else import ./nix/tests.nix { inherit pkgs common build logosContainer; };
 
           logos-container-subprocess = pkgs.symlinkJoin {
             name = "logos-container-subprocess";
@@ -69,9 +71,7 @@
         {
           tests = pkgs.runCommand "logos-container-subprocess-tests"
             {
-              nativeBuildInputs = [ testsPkg ]
-                # setpriv, which the PR_SET_PDEATHSIG test's child runs under.
-                ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.util-linux ];
+              nativeBuildInputs = [ testsPkg ];
             } ''
             echo "Running logos-container-subprocess tests..."
             ${testsPkg}/bin/logos_container_subprocess_tests
