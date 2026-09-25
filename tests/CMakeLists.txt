@@ -1,7 +1,8 @@
 # Logos Container Subprocess tests
 #
 # Exercises the parent-side container directly (launch/terminate/pid/output
-# relay/crash detection) using real child processes (/bin/sleep, /bin/sh).
+# relay/crash detection) using real child processes: test_child, one
+# executable on every platform, built beside the tests.
 # Qt-free: only the parent library is needed.
 
 add_executable(logos_container_subprocess_tests
@@ -17,6 +18,9 @@ target_link_libraries(logos_container_subprocess_tests PRIVATE
 target_include_directories(logos_container_subprocess_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
+
+add_executable(logos_container_test_child test_child.cpp)
+add_dependencies(logos_container_subprocess_tests logos_container_test_child)
 
 # DISCOVERY_MODE PRE_TEST: the default (POST_BUILD) RUNS the test binary at
 # build time to enumerate cases, which is impossible when cross-compiling --

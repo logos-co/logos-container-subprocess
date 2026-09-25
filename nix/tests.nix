@@ -33,7 +33,7 @@ pkgs.stdenv.mkDerivation {
     runHook preBuild
 
     cd build
-    ninja logos_container_subprocess_tests
+    ninja logos_container_subprocess_tests logos_container_test_child
 
     runHook postBuild
   '';
@@ -42,7 +42,7 @@ pkgs.stdenv.mkDerivation {
     runHook preInstall
 
     mkdir -p $out/bin
-    cp bin/logos_container_subprocess_tests $out/bin/
+    cp bin/logos_container_subprocess_tests bin/logos_container_test_child $out/bin/
 
     mkdir -p $out/lib
     cp -r lib/* $out/lib/ || true

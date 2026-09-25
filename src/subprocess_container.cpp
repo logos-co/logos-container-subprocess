@@ -182,6 +182,9 @@ struct ProcessEntry {
 
 std::unordered_map<std::string, std::shared_ptr<ProcessEntry>> s_processes;
 std::mutex s_processesMutex;
+// Children that exited before awaitLoad asked for their verdict, kept (under
+// s_processesMutex) until it does or the name is launched again.
+std::unordered_map<std::string, std::shared_ptr<ProcessEntry>> s_exited;
 
 // ---------------------------------------------------------------------------
 
@@ -218,6 +221,7 @@ IoRuntime::~IoRuntime() {
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
         s_processes.clear();
+        s_exited.clear();
     }
 }
 
@@ -426,6 +430,9 @@ void scheduleWait(std::shared_ptr<ProcessEntry> entry) {
 
             {
                 std::lock_guard<std::mutex> lock(s_processesMutex);
+                auto it = s_processes.find(name);
+                if (it != s_processes.end() && it->second == entry)
+                    s_exited[name] = entry;
                 s_processes.erase(name);
             }
 
@@ -704,14 +711,18 @@ void syncKill(std::shared_ptr<ProcessEntry> entry) {
     // windowless QCoreApplication never receives -- it would silently succeed
     // and do nothing, costing the full grace period per module. WM_QUIT to the
     // main thread is what Qt actually turns into QCoreApplication::quit().
-    if (entry->main_thread_id != 0) {
-        if (!::PostThreadMessageW(entry->main_thread_id, WM_QUIT, 0, 0))
-            spdlog::warn("PostThreadMessage(WM_QUIT) failed for {} ({}); "
-                         "falling back to terminate", entry->name, ::GetLastError());
-    } else {
+    // It cannot be posted before that thread has a message queue, which a child
+    // stopped while still starting may not have yet: keep posting until it lands.
+    DWORD postError = 0;
+    auto postQuit = [&]() {
+        if (::PostThreadMessageW(entry->main_thread_id, WM_QUIT, 0, 0)) return true;
+        postError = ::GetLastError();
+        return false;
+    };
+    bool quitPosted = entry->main_thread_id != 0 && postQuit();
+    if (entry->main_thread_id == 0)
         spdlog::warn("No main thread id recorded for {}; cannot request a "
                      "graceful exit, will terminate", entry->name);
-    }
 #else
     entry->process.request_exit(ec);
 #endif
@@ -720,12 +731,20 @@ void syncKill(std::shared_ptr<ProcessEntry> entry) {
         auto deadline = std::chrono::steady_clock::now() + budget;
         while (!entry->exited.load()) {
             if (std::chrono::steady_clock::now() >= deadline) return false;
+#ifdef _WIN32
+            if (!quitPosted && entry->main_thread_id != 0) quitPosted = postQuit();
+#endif
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         return true;
     };
 
     if (!wait(std::chrono::seconds(5))) {
+#ifdef _WIN32
+        if (!quitPosted)
+            spdlog::warn("PostThreadMessage(WM_QUIT) never reached {} ({})",
+                         entry->name, postError);
+#endif
         spdlog::warn("Process did not terminate gracefully, killing: {}",
                                     entry->name);
         entry->process.terminate(ec);
@@ -830,12 +849,16 @@ LogosCore::LoadOutcome SubprocessContainer::awaitLoad(const std::string& name,
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
         auto it = s_processes.find(name);
-        if (it != s_processes.end())
+        if (it != s_processes.end()) {
             entry = it->second;
+        } else if (auto done = s_exited.find(name); done != s_exited.end()) {
+            // Gone already: what it reported is still its verdict.
+            entry = done->second;
+            s_exited.erase(done);
+        }
     }
 
-    // The entry is erased when the child dies, so its absence here means the
-    // process is already gone -- whatever else is true, the module is not there.
+    // No entry at all: never launched, or terminated by us.
     if (!entry)
         return {LogosCore::LoadVerdict::Failed,
                 "the module process exited before it reported that it had loaded"};
@@ -979,6 +1002,7 @@ bool SubprocessContainer::startProcess(const std::string& name, const std::strin
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
         s_processes[name] = entry;
+        s_exited.erase(name);
     }
 
     asio::post(rt.ctx, [entry]() {
@@ -1052,6 +1076,7 @@ void SubprocessContainer::terminateProcess(const std::string& name)
     std::shared_ptr<ProcessEntry> entry;
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
+        s_exited.erase(name);
         auto it = s_processes.find(name);
         if (it == s_processes.end()) return;
         entry = it->second;
@@ -1065,6 +1090,7 @@ void SubprocessContainer::terminateAllProcesses()
     std::unordered_map<std::string, std::shared_ptr<ProcessEntry>> snapshot;
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
+        s_exited.clear();
         if (s_processes.empty()) return;
         snapshot.swap(s_processes);
     }
@@ -1103,6 +1129,7 @@ void SubprocessContainer::clearAll()
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
         snapshot.swap(s_processes);
+        s_exited.clear();
     }
     for (auto& [n, entry] : snapshot)
         syncKill(entry);
