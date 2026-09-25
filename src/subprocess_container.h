@@ -33,6 +33,10 @@ public:
     // module that never emits a newline (F-014).
     static constexpr std::size_t kMaxOutputLineBytes = 1u * 1024u * 1024u; // 1 MiB
 
+    // Names of the children startChannelProcess() runs. They are not modules:
+    // terminateAll() and getAllPids() leave them to their owner.
+    static constexpr const char* kChannelProcessPrefix = "@channel-";
+
     // -- ModuleContainer interface --
     std::string id() const override { return "subprocess"; }
     bool canHandle(const LogosCore::ModuleDescriptor& desc) const override;
@@ -56,6 +60,11 @@ public:
     static bool sendTokenToProcess(const std::string& name,
                                     const std::string& token,
                                     int max_wait_ms = 5000);
+    // A line on the child's stdin that, unlike a token, leaves it open for more:
+    // a control channel. False once the child is gone or its stdin is closed.
+    static bool writeLineToProcess(const std::string& name, const std::string& line);
+    // EOF on the child's stdin.
+    static void closeProcessStdin(const std::string& name);
     static void terminateProcess(const std::string& name);
     static void terminateAllProcesses();
     static bool hasProcess(const std::string& name);
