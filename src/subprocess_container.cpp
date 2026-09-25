@@ -124,6 +124,8 @@ struct ProcessEntry {
     // unforgeable, with no predictable filesystem path to squat. Held open
     // from launch until sendToken writes the token and closes it.
     asio::writable_pipe                       in_pipe;
+    // Writers and closers of in_pipe, which a control channel uses from any thread.
+    std::mutex                                in_mutex;
     SubprocessContainer::ProcessCallbacks     callbacks;
     std::string                               name;
     std::array<char, 4096>                    out_read_buf{};
@@ -704,7 +706,10 @@ void syncKill(std::shared_ptr<ProcessEntry> entry) {
     // Close the stdin write end too: if we kill the child before a token was
     // delivered, this gives it EOF on fd 0 so a blocking token read returns
     // instead of hanging until the wait deadline.
-    entry->in_pipe.close(ec);
+    {
+        std::lock_guard<std::mutex> lock(entry->in_mutex);
+        entry->in_pipe.close(ec);
+    }
 
 #ifdef _WIN32
     // NOT request_exit(): on Windows that is EnumWindows + WM_CLOSE, which a
@@ -1045,12 +1050,15 @@ bool SubprocessContainer::sendTokenToProcess(const std::string& name,
     payload.push_back('\n');
 
     boost::system::error_code ec;
-    boost::asio::write(entry->in_pipe, boost::asio::buffer(payload), ec);
+    {
+        std::lock_guard<std::mutex> lock(entry->in_mutex);
+        boost::asio::write(entry->in_pipe, boost::asio::buffer(payload), ec);
 
-    // Close the write end so the child sees EOF after the token. Best-effort:
-    // even if the close reports an error the token bytes were already written.
-    boost::system::error_code close_ec;
-    entry->in_pipe.close(close_ec);
+        // Close the write end so the child sees EOF after the token. Best-effort:
+        // even if the close reports an error the token bytes were already written.
+        boost::system::error_code close_ec;
+        entry->in_pipe.close(close_ec);
+    }
 
     if (ec) {
         spdlog::error("Failed to write token to stdin pipe for {}: {}",
@@ -1069,6 +1077,43 @@ bool SubprocessContainer::sendTokenToProcess(const std::string& name,
     }
 
     return true;
+}
+
+bool SubprocessContainer::writeLineToProcess(const std::string& name, const std::string& line)
+{
+    std::shared_ptr<ProcessEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(s_processesMutex);
+        auto it = s_processes.find(name);
+        if (it != s_processes.end()) entry = it->second;
+    }
+    if (!entry) return false;
+
+    std::string payload = line;
+    payload.push_back('\n');
+    boost::system::error_code ec;
+    std::lock_guard<std::mutex> lock(entry->in_mutex);
+    if (!entry->in_pipe.is_open()) return false;
+    boost::asio::write(entry->in_pipe, boost::asio::buffer(payload), ec);
+    if (ec) {
+        spdlog::warn("Failed to write to stdin of {}: {}", name, ec.message());
+        return false;
+    }
+    return true;
+}
+
+void SubprocessContainer::closeProcessStdin(const std::string& name)
+{
+    std::shared_ptr<ProcessEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(s_processesMutex);
+        auto it = s_processes.find(name);
+        if (it != s_processes.end()) entry = it->second;
+    }
+    if (!entry) return;
+    boost::system::error_code ec;
+    std::lock_guard<std::mutex> lock(entry->in_mutex);
+    entry->in_pipe.close(ec);
 }
 
 void SubprocessContainer::terminateProcess(const std::string& name)

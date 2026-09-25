@@ -6,6 +6,7 @@
 //   streams       "out-line" on stdout and "err-line" on stderr
 //   flood N       N NUL bytes on stdout, no newline
 //   token         read a line from stdin, print "GOT:" and it
+//   echo-lines    print "ECHO:" and each line read from stdin, until EOF
 //   sleep S       stay up S seconds, or until asked to stop
 //   exit N        exit with code N
 //   crash         die on an access violation
@@ -105,6 +106,11 @@ int main(int argc, char** argv)
             std::getline(std::cin, token);
             if (!token.empty() && token.back() == '\r') token.pop_back();
             std::cout << "GOT:" << token << std::endl;
+        } else if (step == "echo-lines") {
+            for (std::string line; std::getline(std::cin, line);) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                std::cout << "ECHO:" << line << std::endl;
+            }
         } else if (step == "sleep" && hasArg) {
             stayUp(std::atoi(script[++i].c_str()));
         } else if (step == "exit" && hasArg) {

@@ -479,6 +479,56 @@ TEST_F(SubprocessContainerTest, SendToken_DeliversTokenOverStdin) {
         << "token delivered over stdin did not match what the parent sent";
 }
 
+// A control channel: lines on stdin while the child runs, then EOF.
+TEST_F(SubprocessContainerTest, WriteLine_KeepsStdinOpenUntilClosed) {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<std::string> echoed;
+    std::atomic<bool> finished{false};
+    int exitCode = -1;
+
+    SubprocessContainer::ProcessCallbacks cb;
+    cb.onOutput = [&](const std::string&, const std::string& line, bool isStderr) {
+        if (isStderr || line.rfind("ECHO:", 0) != 0) return;
+        std::lock_guard<std::mutex> lock(mtx);
+        echoed.push_back(line.substr(5));
+        cv.notify_all();
+    };
+    cb.onFinished = [&](const std::string&, int code, bool) {
+        std::lock_guard<std::mutex> lock(mtx);
+        exitCode = code;
+        finished.store(true);
+        cv.notify_all();
+    };
+    ASSERT_TRUE(SubprocessContainer::startProcess("control", childPath(), {"echo-lines"}, cb));
+
+    EXPECT_TRUE(SubprocessContainer::writeLineToProcess("control", "first"));
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return echoed.size() == 1; }));
+    }
+    // Still open: a second line reaches the same child.
+    EXPECT_TRUE(SubprocessContainer::writeLineToProcess("control", "second"));
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return echoed.size() == 2; }));
+    }
+    EXPECT_EQ(echoed, (std::vector<std::string>{"first", "second"}));
+
+    // EOF ends the child's read loop, so it exits on its own.
+    SubprocessContainer::closeProcessStdin("control");
+    EXPECT_FALSE(SubprocessContainer::writeLineToProcess("control", "late"));
+    std::unique_lock<std::mutex> lock(mtx);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return finished.load(); }))
+        << "the child did not exit after its stdin closed";
+    EXPECT_EQ(exitCode, 0);
+}
+
+TEST_F(SubprocessContainerTest, WriteLine_FailsForUnknownProcess) {
+    EXPECT_FALSE(SubprocessContainer::writeLineToProcess("no_such_module", "line"));
+    SubprocessContainer::closeProcessStdin("no_such_module");   // a no-op, not a crash
+}
+
 TEST_F(SubprocessContainerTest, SendToken_FailsForUnknownProcess) {
     // No entry registered for this name → nothing to write the token to.
     EXPECT_FALSE(SubprocessContainer::sendTokenToProcess("no_such_module", "tok"));

@@ -56,6 +56,11 @@ public:
     static bool sendTokenToProcess(const std::string& name,
                                     const std::string& token,
                                     int max_wait_ms = 5000);
+    // A line on the child's stdin that, unlike a token, leaves it open for more:
+    // a control channel. False once the child is gone or its stdin is closed.
+    static bool writeLineToProcess(const std::string& name, const std::string& line);
+    // EOF on the child's stdin.
+    static void closeProcessStdin(const std::string& name);
     static void terminateProcess(const std::string& name);
     static void terminateAllProcesses();
     static bool hasProcess(const std::string& name);
