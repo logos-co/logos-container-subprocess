@@ -33,6 +33,10 @@ public:
     // module that never emits a newline (F-014).
     static constexpr std::size_t kMaxOutputLineBytes = 1u * 1024u * 1024u; // 1 MiB
 
+    // Names of the children startChannelProcess() runs. They are not modules:
+    // terminateAll() and getAllPids() leave them to their owner.
+    static constexpr const char* kChannelProcessPrefix = "@channel-";
+
     // -- ModuleContainer interface --
     std::string id() const override { return "subprocess"; }
     bool canHandle(const LogosCore::ModuleDescriptor& desc) const override;

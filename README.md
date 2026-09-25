@@ -35,6 +35,12 @@ where available) so a same-host attacker cannot intercept or inject the token.
 Supporting headers (`peer_credentials.h`, `unix_socket_path.h`,
 `path_safety.h`) are the shared handoff helpers.
 
+It also defines `LogosCore::startChannelProcess()`
+(`subprocess_channel_process.cpp`), the contract's seam for a child that is not a
+module, such as the runtime host an app spawns. That child's stdin stays open as a
+line channel, its stdout lines reach the parent unlogged, and `terminateAll()` and
+`getAllPids()`, which are about modules, leave it out.
+
 ## Build & test
 
 ```bash

@@ -886,9 +886,31 @@ void SubprocessContainer::terminate(const std::string& name)
     terminateProcess(name);
 }
 
+namespace {
+bool isChannelProcess(const std::string& name)
+{
+    return name.rfind(SubprocessContainer::kChannelProcessPrefix, 0) == 0;
+}
+} // namespace
+
 void SubprocessContainer::terminateAll()
 {
-    terminateAllProcesses();
+    std::vector<std::shared_ptr<ProcessEntry>> modules;
+    {
+        std::lock_guard<std::mutex> lock(s_processesMutex);
+        for (auto it = s_exited.begin(); it != s_exited.end();)
+            it = isChannelProcess(it->first) ? std::next(it) : s_exited.erase(it);
+        for (auto it = s_processes.begin(); it != s_processes.end();) {
+            if (isChannelProcess(it->first)) {
+                ++it;
+                continue;
+            }
+            modules.push_back(it->second);
+            it = s_processes.erase(it);
+        }
+    }
+    for (auto& entry : modules)
+        syncKill(entry);
 }
 
 bool SubprocessContainer::hasModule(const std::string& name) const
@@ -905,7 +927,10 @@ std::optional<int64_t> SubprocessContainer::pid(const std::string& name) const
 
 std::unordered_map<std::string, int64_t> SubprocessContainer::getAllPids() const
 {
-    return getAllProcessIds();
+    std::unordered_map<std::string, int64_t> pids = getAllProcessIds();
+    for (auto it = pids.begin(); it != pids.end();)
+        it = isChannelProcess(it->first) ? pids.erase(it) : std::next(it);
+    return pids;
 }
 
 // ===========================================================================

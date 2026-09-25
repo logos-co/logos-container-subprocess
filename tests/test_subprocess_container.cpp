@@ -7,6 +7,7 @@
 // =============================================================================
 #include <gtest/gtest.h>
 #include "subprocess_container.h"
+#include <logos_container/channel_process.h>
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -527,6 +528,69 @@ TEST_F(SubprocessContainerTest, WriteLine_KeepsStdinOpenUntilClosed) {
 TEST_F(SubprocessContainerTest, WriteLine_FailsForUnknownProcess) {
     EXPECT_FALSE(SubprocessContainer::writeLineToProcess("no_such_module", "line"));
     SubprocessContainer::closeProcessStdin("no_such_module");   // a no-op, not a crash
+}
+
+// A channel process: lines both ways, its stderr as its log, and EOF ends it.
+TEST_F(SubprocessContainerTest, ChannelProcess_TalksInLinesUntilItsStdinCloses) {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<std::string> lines;
+    std::vector<std::string> logs;
+    bool exited = false;
+    int exitCode = -1;
+
+    LogosCore::ChannelCallbacks cb;
+    cb.onLine = [&](const std::string& line) {
+        std::lock_guard<std::mutex> lock(mtx);
+        lines.push_back(line);
+        cv.notify_all();
+    };
+    cb.onLog = [&](const std::string& line) {
+        std::lock_guard<std::mutex> lock(mtx);
+        logs.push_back(line);
+        cv.notify_all();
+    };
+    cb.onExit = [&](int code, bool) {
+        std::lock_guard<std::mutex> lock(mtx);
+        exitCode = code;
+        exited = true;
+        cv.notify_all();
+    };
+    auto process = LogosCore::startChannelProcess(childPath(), {"streams", "echo-lines"}, cb);
+    ASSERT_TRUE(process);
+    EXPECT_GT(process->pid(), 0);
+    EXPECT_TRUE(process->writeLine("hello"));
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
+                                [&] { return lines.size() == 2 && logs.size() == 1; }));
+    }
+    EXPECT_EQ(lines, (std::vector<std::string>{"out-line", "ECHO:hello"}));
+    EXPECT_EQ(logs, (std::vector<std::string>{"err-line"}));
+
+    process->closeInput();
+    std::unique_lock<std::mutex> lock(mtx);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return exited; }));
+    EXPECT_EQ(exitCode, 0);
+}
+
+// Not a module: stopping every module, or listing their pids, leaves it alone.
+TEST_F(SubprocessContainerTest, ChannelProcess_IsNoModule) {
+    auto process = LogosCore::startChannelProcess(childPath(), {"echo-lines"}, {});
+    ASSERT_TRUE(process);
+    LogosCore::LoadedModuleHandle handle;
+    launchFakeModule(container, "cp_module", handle);
+
+    const auto pids = container.getAllPids();
+    EXPECT_EQ(pids.size(), 1u);
+    EXPECT_EQ(pids.count("cp_module"), 1u);
+
+    container.terminateAll();
+    EXPECT_FALSE(container.hasModule("cp_module"));
+    EXPECT_TRUE(process->writeLine("still here"));
+
+    process->terminate();
+    EXPECT_FALSE(process->writeLine("gone"));
 }
 
 TEST_F(SubprocessContainerTest, SendToken_FailsForUnknownProcess) {
