@@ -556,6 +556,25 @@ TEST_F(SubprocessContainerTest, AwaitLoad_CarriesTheReasonTheChildReported) {
     EXPECT_LT(elapsed, std::chrono::seconds(4));
 }
 
+// The same when the child is gone before the loader asks: a loader running
+// behind its child used to get "exited before it reported" instead.
+TEST_F(SubprocessContainerTest, AwaitLoad_AfterTheChildIsGone_StillCarriesItsReason) {
+    LogosCore::ModuleDescriptor desc;
+    desc.name = "gone_mod";
+    LogosCore::LoadedModuleHandle handle;
+    ASSERT_TRUE(container.launch(desc, childPath(),
+        {"print", "@logos-load-status failed undefined symbol: logos_module_install", "exit", "1"},
+        nullptr, handle));
+    for (int i = 0; i < 250 && container.hasModule("gone_mod"); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    ASSERT_FALSE(container.hasModule("gone_mod"));
+
+    const auto out = container.awaitLoad("gone_mod", std::chrono::seconds(2));
+    EXPECT_EQ(out.verdict, LogosCore::LoadVerdict::Failed);
+    EXPECT_NE(out.reason.find("undefined symbol: logos_module_install"), std::string::npos)
+        << out.reason;
+}
+
 // A child that dies without a word is still a failed load, and the exit code is
 // the only reason available to describe it.
 TEST_F(SubprocessContainerTest, AwaitLoad_ReportsFailureWhenTheChildJustDies) {

@@ -182,6 +182,9 @@ struct ProcessEntry {
 
 std::unordered_map<std::string, std::shared_ptr<ProcessEntry>> s_processes;
 std::mutex s_processesMutex;
+// Children that exited before awaitLoad asked for their verdict, kept (under
+// s_processesMutex) until it does or the name is launched again.
+std::unordered_map<std::string, std::shared_ptr<ProcessEntry>> s_exited;
 
 // ---------------------------------------------------------------------------
 
@@ -218,6 +221,7 @@ IoRuntime::~IoRuntime() {
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
         s_processes.clear();
+        s_exited.clear();
     }
 }
 
@@ -426,6 +430,9 @@ void scheduleWait(std::shared_ptr<ProcessEntry> entry) {
 
             {
                 std::lock_guard<std::mutex> lock(s_processesMutex);
+                auto it = s_processes.find(name);
+                if (it != s_processes.end() && it->second == entry)
+                    s_exited[name] = entry;
                 s_processes.erase(name);
             }
 
@@ -842,12 +849,16 @@ LogosCore::LoadOutcome SubprocessContainer::awaitLoad(const std::string& name,
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
         auto it = s_processes.find(name);
-        if (it != s_processes.end())
+        if (it != s_processes.end()) {
             entry = it->second;
+        } else if (auto done = s_exited.find(name); done != s_exited.end()) {
+            // Gone already: what it reported is still its verdict.
+            entry = done->second;
+            s_exited.erase(done);
+        }
     }
 
-    // The entry is erased when the child dies, so its absence here means the
-    // process is already gone -- whatever else is true, the module is not there.
+    // No entry at all: never launched, or terminated by us.
     if (!entry)
         return {LogosCore::LoadVerdict::Failed,
                 "the module process exited before it reported that it had loaded"};
@@ -991,6 +1002,7 @@ bool SubprocessContainer::startProcess(const std::string& name, const std::strin
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
         s_processes[name] = entry;
+        s_exited.erase(name);
     }
 
     asio::post(rt.ctx, [entry]() {
@@ -1064,6 +1076,7 @@ void SubprocessContainer::terminateProcess(const std::string& name)
     std::shared_ptr<ProcessEntry> entry;
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
+        s_exited.erase(name);
         auto it = s_processes.find(name);
         if (it == s_processes.end()) return;
         entry = it->second;
@@ -1077,6 +1090,7 @@ void SubprocessContainer::terminateAllProcesses()
     std::unordered_map<std::string, std::shared_ptr<ProcessEntry>> snapshot;
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
+        s_exited.clear();
         if (s_processes.empty()) return;
         snapshot.swap(s_processes);
     }
@@ -1115,6 +1129,7 @@ void SubprocessContainer::clearAll()
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
         snapshot.swap(s_processes);
+        s_exited.clear();
     }
     for (auto& [n, entry] : snapshot)
         syncKill(entry);
