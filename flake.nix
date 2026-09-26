@@ -2,10 +2,10 @@
   description = "Subprocess container: process-isolated ModuleContainer implementation for the Logos module runtime";
 
   inputs = {
-    logos-nix.url = "github:logos-co/logos-nix";
+    logos-nix.url = "github:logos-co/logos-nix/feat/standalone-apps";
     nixpkgs.follows = "logos-nix/nixpkgs";
     # The channel-process seam, on its branch until it merges.
-    logos-container.url = "github:logos-co/logos-container/feat/runtime-process";
+    logos-container.url = "github:logos-co/logos-container/feat/standalone-apps";
     # Without this, logos-container resolves its OWN pinned logos-nix, so
     # overriding logos-nix here (as the workspace and the Windows work both do)
     # silently would not reach it.
