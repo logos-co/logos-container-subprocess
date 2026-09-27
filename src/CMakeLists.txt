@@ -32,6 +32,8 @@ add_library(logos_container_subprocess STATIC
     # Provides LogosCore::makeContainer() (logos-container factory seam) so
     # consumers select this container at link time without naming it.
     subprocess_container_factory.cpp
+    # And LogosCore::startChannelProcess(), the channel-process seam.
+    subprocess_channel_process.cpp
 )
 
 target_link_libraries(logos_container_subprocess PUBLIC

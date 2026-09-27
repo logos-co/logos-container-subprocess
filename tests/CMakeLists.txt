@@ -22,6 +22,10 @@ target_include_directories(logos_container_subprocess_tests PRIVATE
 add_executable(logos_container_test_child test_child.cpp)
 add_dependencies(logos_container_subprocess_tests logos_container_test_child)
 
+add_executable(logos_container_test_parent test_parent.cpp)
+target_link_libraries(logos_container_test_parent PRIVATE logos_container_subprocess)
+add_dependencies(logos_container_subprocess_tests logos_container_test_parent)
+
 # DISCOVERY_MODE PRE_TEST: the default (POST_BUILD) RUNS the test binary at
 # build time to enumerate cases, which is impossible when cross-compiling --
 # the build host cannot execute a PE, and the attempt fails obscurely with

@@ -124,6 +124,8 @@ struct ProcessEntry {
     // unforgeable, with no predictable filesystem path to squat. Held open
     // from launch until sendToken writes the token and closes it.
     asio::writable_pipe                       in_pipe;
+    // Writers and closers of in_pipe, which a control channel uses from any thread.
+    std::mutex                                in_mutex;
     SubprocessContainer::ProcessCallbacks     callbacks;
     std::string                               name;
     std::array<char, 4096>                    out_read_buf{};
@@ -186,6 +188,11 @@ std::mutex s_processesMutex;
 // s_processesMutex) until it does or the name is launched again.
 std::unordered_map<std::string, std::shared_ptr<ProcessEntry>> s_exited;
 
+bool isChannelProcess(const std::string& name)
+{
+    return name.rfind(SubprocessContainer::kChannelProcessPrefix, 0) == 0;
+}
+
 // ---------------------------------------------------------------------------
 
 IoRuntime::~IoRuntime() {
@@ -220,6 +227,11 @@ IoRuntime::~IoRuntime() {
     // reactor.deregister_descriptor) runs against a live reactor.
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
+        // Channel processes are never destroyed, so never killed: their loss would wake
+        // this process's threads while statics die. Each follows its parent itself.
+        static auto* kept = new std::vector<std::shared_ptr<ProcessEntry>>;
+        for (const auto& [name, entry] : s_processes)
+            if (entry && isChannelProcess(name)) kept->push_back(entry);
         s_processes.clear();
         s_exited.clear();
     }
@@ -704,7 +716,10 @@ void syncKill(std::shared_ptr<ProcessEntry> entry) {
     // Close the stdin write end too: if we kill the child before a token was
     // delivered, this gives it EOF on fd 0 so a blocking token read returns
     // instead of hanging until the wait deadline.
-    entry->in_pipe.close(ec);
+    {
+        std::lock_guard<std::mutex> lock(entry->in_mutex);
+        entry->in_pipe.close(ec);
+    }
 
 #ifdef _WIN32
     // NOT request_exit(): on Windows that is EnumWindows + WM_CLOSE, which a
@@ -883,7 +898,22 @@ void SubprocessContainer::terminate(const std::string& name)
 
 void SubprocessContainer::terminateAll()
 {
-    terminateAllProcesses();
+    std::vector<std::shared_ptr<ProcessEntry>> modules;
+    {
+        std::lock_guard<std::mutex> lock(s_processesMutex);
+        for (auto it = s_exited.begin(); it != s_exited.end();)
+            it = isChannelProcess(it->first) ? std::next(it) : s_exited.erase(it);
+        for (auto it = s_processes.begin(); it != s_processes.end();) {
+            if (isChannelProcess(it->first)) {
+                ++it;
+                continue;
+            }
+            modules.push_back(it->second);
+            it = s_processes.erase(it);
+        }
+    }
+    for (auto& entry : modules)
+        syncKill(entry);
 }
 
 bool SubprocessContainer::hasModule(const std::string& name) const
@@ -900,7 +930,10 @@ std::optional<int64_t> SubprocessContainer::pid(const std::string& name) const
 
 std::unordered_map<std::string, int64_t> SubprocessContainer::getAllPids() const
 {
-    return getAllProcessIds();
+    std::unordered_map<std::string, int64_t> pids = getAllProcessIds();
+    for (auto it = pids.begin(); it != pids.end();)
+        it = isChannelProcess(it->first) ? pids.erase(it) : std::next(it);
+    return pids;
 }
 
 // ===========================================================================
@@ -1045,12 +1078,15 @@ bool SubprocessContainer::sendTokenToProcess(const std::string& name,
     payload.push_back('\n');
 
     boost::system::error_code ec;
-    boost::asio::write(entry->in_pipe, boost::asio::buffer(payload), ec);
+    {
+        std::lock_guard<std::mutex> lock(entry->in_mutex);
+        boost::asio::write(entry->in_pipe, boost::asio::buffer(payload), ec);
 
-    // Close the write end so the child sees EOF after the token. Best-effort:
-    // even if the close reports an error the token bytes were already written.
-    boost::system::error_code close_ec;
-    entry->in_pipe.close(close_ec);
+        // Close the write end so the child sees EOF after the token. Best-effort:
+        // even if the close reports an error the token bytes were already written.
+        boost::system::error_code close_ec;
+        entry->in_pipe.close(close_ec);
+    }
 
     if (ec) {
         spdlog::error("Failed to write token to stdin pipe for {}: {}",
@@ -1069,6 +1105,43 @@ bool SubprocessContainer::sendTokenToProcess(const std::string& name,
     }
 
     return true;
+}
+
+bool SubprocessContainer::writeLineToProcess(const std::string& name, const std::string& line)
+{
+    std::shared_ptr<ProcessEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(s_processesMutex);
+        auto it = s_processes.find(name);
+        if (it != s_processes.end()) entry = it->second;
+    }
+    if (!entry) return false;
+
+    std::string payload = line;
+    payload.push_back('\n');
+    boost::system::error_code ec;
+    std::lock_guard<std::mutex> lock(entry->in_mutex);
+    if (!entry->in_pipe.is_open()) return false;
+    boost::asio::write(entry->in_pipe, boost::asio::buffer(payload), ec);
+    if (ec) {
+        spdlog::warn("Failed to write to stdin of {}: {}", name, ec.message());
+        return false;
+    }
+    return true;
+}
+
+void SubprocessContainer::closeProcessStdin(const std::string& name)
+{
+    std::shared_ptr<ProcessEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(s_processesMutex);
+        auto it = s_processes.find(name);
+        if (it != s_processes.end()) entry = it->second;
+    }
+    if (!entry) return;
+    boost::system::error_code ec;
+    std::lock_guard<std::mutex> lock(entry->in_mutex);
+    entry->in_pipe.close(ec);
 }
 
 void SubprocessContainer::terminateProcess(const std::string& name)

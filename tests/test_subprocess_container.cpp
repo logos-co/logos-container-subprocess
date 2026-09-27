@@ -7,6 +7,7 @@
 // =============================================================================
 #include <gtest/gtest.h>
 #include "subprocess_container.h"
+#include <logos_container/channel_process.h>
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -14,6 +15,8 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -31,6 +34,7 @@
 #include <future>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 #ifdef __APPLE__
@@ -478,6 +482,139 @@ TEST_F(SubprocessContainerTest, SendToken_DeliversTokenOverStdin) {
     EXPECT_EQ(received, secret)
         << "token delivered over stdin did not match what the parent sent";
 }
+
+// A control channel: lines on stdin while the child runs, then EOF.
+TEST_F(SubprocessContainerTest, WriteLine_KeepsStdinOpenUntilClosed) {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<std::string> echoed;
+    std::atomic<bool> finished{false};
+    int exitCode = -1;
+
+    SubprocessContainer::ProcessCallbacks cb;
+    cb.onOutput = [&](const std::string&, const std::string& line, bool isStderr) {
+        if (isStderr || line.rfind("ECHO:", 0) != 0) return;
+        std::lock_guard<std::mutex> lock(mtx);
+        echoed.push_back(line.substr(5));
+        cv.notify_all();
+    };
+    cb.onFinished = [&](const std::string&, int code, bool) {
+        std::lock_guard<std::mutex> lock(mtx);
+        exitCode = code;
+        finished.store(true);
+        cv.notify_all();
+    };
+    ASSERT_TRUE(SubprocessContainer::startProcess("control", childPath(), {"echo-lines"}, cb));
+
+    EXPECT_TRUE(SubprocessContainer::writeLineToProcess("control", "first"));
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return echoed.size() == 1; }));
+    }
+    // Still open: a second line reaches the same child.
+    EXPECT_TRUE(SubprocessContainer::writeLineToProcess("control", "second"));
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return echoed.size() == 2; }));
+    }
+    EXPECT_EQ(echoed, (std::vector<std::string>{"first", "second"}));
+
+    // EOF ends the child's read loop, so it exits on its own.
+    SubprocessContainer::closeProcessStdin("control");
+    EXPECT_FALSE(SubprocessContainer::writeLineToProcess("control", "late"));
+    std::unique_lock<std::mutex> lock(mtx);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return finished.load(); }))
+        << "the child did not exit after its stdin closed";
+    EXPECT_EQ(exitCode, 0);
+}
+
+TEST_F(SubprocessContainerTest, WriteLine_FailsForUnknownProcess) {
+    EXPECT_FALSE(SubprocessContainer::writeLineToProcess("no_such_module", "line"));
+    SubprocessContainer::closeProcessStdin("no_such_module");   // a no-op, not a crash
+}
+
+// A channel process: lines both ways, its stderr as its log, and EOF ends it.
+TEST_F(SubprocessContainerTest, ChannelProcess_TalksInLinesUntilItsStdinCloses) {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<std::string> lines;
+    std::vector<std::string> logs;
+    bool exited = false;
+    int exitCode = -1;
+
+    LogosCore::ChannelCallbacks cb;
+    cb.onLine = [&](const std::string& line) {
+        std::lock_guard<std::mutex> lock(mtx);
+        lines.push_back(line);
+        cv.notify_all();
+    };
+    cb.onLog = [&](const std::string& line) {
+        std::lock_guard<std::mutex> lock(mtx);
+        logs.push_back(line);
+        cv.notify_all();
+    };
+    cb.onExit = [&](int code, bool) {
+        std::lock_guard<std::mutex> lock(mtx);
+        exitCode = code;
+        exited = true;
+        cv.notify_all();
+    };
+    auto process = LogosCore::startChannelProcess(childPath(), {"streams", "echo-lines"}, cb);
+    ASSERT_TRUE(process);
+    EXPECT_GT(process->pid(), 0);
+    EXPECT_TRUE(process->writeLine("hello"));
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
+                                [&] { return lines.size() == 2 && logs.size() == 1; }));
+    }
+    EXPECT_EQ(lines, (std::vector<std::string>{"out-line", "ECHO:hello"}));
+    EXPECT_EQ(logs, (std::vector<std::string>{"err-line"}));
+
+    process->closeInput();
+    std::unique_lock<std::mutex> lock(mtx);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return exited; }));
+    EXPECT_EQ(exitCode, 0);
+}
+
+// Not a module: stopping every module, or listing their pids, leaves it alone.
+TEST_F(SubprocessContainerTest, ChannelProcess_IsNoModule) {
+    auto process = LogosCore::startChannelProcess(childPath(), {"echo-lines"}, {});
+    ASSERT_TRUE(process);
+    LogosCore::LoadedModuleHandle handle;
+    launchFakeModule(container, "cp_module", handle);
+
+    const auto pids = container.getAllPids();
+    EXPECT_EQ(pids.size(), 1u);
+    EXPECT_EQ(pids.count("cp_module"), 1u);
+
+    container.terminateAll();
+    EXPECT_FALSE(container.hasModule("cp_module"));
+    EXPECT_TRUE(process->writeLine("still here"));
+
+    process->terminate();
+    EXPECT_FALSE(process->writeLine("gone"));
+}
+
+#ifndef _WIN32
+// exit() in its parent leaves it running: a kill in the parent's static teardown
+// wakes the parent's threads while statics die. (Windows' job object kills it.)
+TEST_F(SubprocessContainerTest, ChannelProcess_OutlivesItsParentsExit) {
+    const auto parent = std::filesystem::path(childPath()).parent_path() / "logos_container_test_parent";
+    const std::string command = "'" + parent.string() + "' '" + childPath() + "' sleep 5";
+    FILE* out = ::popen(command.c_str(), "r");
+    ASSERT_NE(out, nullptr);
+    char line[64] = {};
+    const bool said = std::fgets(line, sizeof line, out) != nullptr;
+    const int status = ::pclose(out);   // once the parent has exited
+    ASSERT_TRUE(said);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+    const pid_t child = static_cast<pid_t>(std::atoll(line));
+    ASSERT_GT(child, 0);
+    EXPECT_EQ(::kill(child, 0), 0) << "its parent's exit killed it";
+    ::kill(child, SIGKILL);
+}
+#endif
 
 TEST_F(SubprocessContainerTest, SendToken_FailsForUnknownProcess) {
     // No entry registered for this name → nothing to write the token to.
