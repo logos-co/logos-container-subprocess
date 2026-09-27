@@ -12,16 +12,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1790365563,
-        "narHash": "sha256-zaftg19xRkulrdS9GnEArSBkEt4v/LXJGBL11fTJel0=",
+        "lastModified": 1790445567,
+        "narHash": "sha256-hvOte6HR+m7HKkkJmF15JhYLHxMqmPhMou5+IW0r0ZM=",
         "owner": "logos-co",
         "repo": "logos-container",
-        "rev": "3ef2486f986dc10bdb3788999179339838c24d15",
+        "rev": "9f02ed63bcf94e887a87cbfe4fc9305423e7612f",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
-        "ref": "feat/runtime-process",
+        "ref": "feat/standalone-apps",
         "repo": "logos-container",
         "type": "github"
       }
@@ -32,15 +32,16 @@
         "nixpkgs-windows": "nixpkgs-windows"
       },
       "locked": {
-        "lastModified": 1786399295,
-        "narHash": "sha256-Bl1A0UgsIXioZw5uEW8Jl5u7FfZcFMnpYlpsdezFwK0=",
+        "lastModified": 1790445097,
+        "narHash": "sha256-3IqctoP7XYOP6yor+uB16lBKPytP/PyAXp1VBpLjkw4=",
         "owner": "logos-co",
         "repo": "logos-nix",
-        "rev": "6e0f4a7120fced10829b0b3a698ff619a11d4605",
+        "rev": "12022015768c7239c4072657be818e6b9f8aca34",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
+        "ref": "feat/standalone-apps",
         "repo": "logos-nix",
         "type": "github"
       }

@@ -2,10 +2,10 @@
   description = "Subprocess container: process-isolated ModuleContainer implementation for the Logos module runtime";
 
   inputs = {
-    logos-nix.url = "github:logos-co/logos-nix";
+    logos-nix.url = "github:logos-co/logos-nix/feat/standalone-apps";
     nixpkgs.follows = "logos-nix/nixpkgs";
     # The channel-process seam, on its branch until it merges.
-    logos-container.url = "github:logos-co/logos-container/feat/runtime-process";
+    logos-container.url = "github:logos-co/logos-container/feat/standalone-apps";
     # Without this, logos-container resolves its OWN pinned logos-nix, so
     # overriding logos-nix here (as the workspace and the Windows work both do)
     # silently would not reach it.
@@ -21,16 +21,19 @@
         logosContainer = logos-container.packages.${system}.default;
       });
 
-      # Same, plus the "x86_64-windows" pseudo-system. Not logos-nix's shared
+      # Same, plus the "x86_64-windows" and "aarch64-android" pseudo-systems.
+      # Not logos-nix's shared
       # forAllTargets, because this flake also threads logosContainer through
       # -- and that dependency follows the TARGET (it is a header-only
       # contract compiled into this library, not a tool run at build time).
       forAllTargets = f:
-        nixpkgs.lib.genAttrs (systems ++ [ "x86_64-windows" ]) (system: f {
+        nixpkgs.lib.genAttrs (systems ++ [ "x86_64-windows" "aarch64-android" ]) (system: f {
           inherit system;
           pkgs =
             if system == "x86_64-windows"
             then logos-nix.lib.mkWindowsPkgs { buildSystem = "x86_64-linux"; }
+            else if system == "aarch64-android"
+            then logos-nix.lib.mobileTargets.aarch64-android.pkgs
             else import nixpkgs { inherit system; };
           logosContainer = logos-container.packages.${system}.default;
         });
