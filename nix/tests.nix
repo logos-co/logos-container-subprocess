@@ -33,7 +33,7 @@ pkgs.stdenv.mkDerivation {
     runHook preBuild
 
     cd build
-    ninja logos_container_subprocess_tests logos_container_test_child
+    ninja logos_container_subprocess_tests logos_container_test_child logos_container_test_parent
 
     runHook postBuild
   '';
@@ -42,13 +42,14 @@ pkgs.stdenv.mkDerivation {
     runHook preInstall
 
     mkdir -p $out/bin
-    cp bin/logos_container_subprocess_tests bin/logos_container_test_child $out/bin/
+    cp bin/logos_container_subprocess_tests bin/logos_container_test_child bin/logos_container_test_parent $out/bin/
 
     mkdir -p $out/lib
     cp -r lib/* $out/lib/ || true
 
     ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
       patchelf --set-rpath "$out/lib:${pkgs.boost}/lib:${pkgs.gtest}/lib:${pkgs.spdlog}/lib:${pkgs.fmt}/lib:${pkgs.stdenv.cc.cc.lib}/lib" $out/bin/logos_container_subprocess_tests || true
+      patchelf --set-rpath "$out/lib:${pkgs.boost}/lib:${pkgs.spdlog}/lib:${pkgs.fmt}/lib:${pkgs.stdenv.cc.cc.lib}/lib" $out/bin/logos_container_test_parent || true
     ''}
 
     runHook postInstall

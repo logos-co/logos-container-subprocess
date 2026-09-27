@@ -34,7 +34,7 @@ public:
     static constexpr std::size_t kMaxOutputLineBytes = 1u * 1024u * 1024u; // 1 MiB
 
     // Names of the children startChannelProcess() runs. They are not modules:
-    // terminateAll() and getAllPids() leave them to their owner.
+    // terminateAll() and getAllPids() leave them to their owner, and exit() leaves them running.
     static constexpr const char* kChannelProcessPrefix = "@channel-";
 
     // -- ModuleContainer interface --

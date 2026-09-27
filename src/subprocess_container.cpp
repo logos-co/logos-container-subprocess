@@ -188,6 +188,11 @@ std::mutex s_processesMutex;
 // s_processesMutex) until it does or the name is launched again.
 std::unordered_map<std::string, std::shared_ptr<ProcessEntry>> s_exited;
 
+bool isChannelProcess(const std::string& name)
+{
+    return name.rfind(SubprocessContainer::kChannelProcessPrefix, 0) == 0;
+}
+
 // ---------------------------------------------------------------------------
 
 IoRuntime::~IoRuntime() {
@@ -222,6 +227,11 @@ IoRuntime::~IoRuntime() {
     // reactor.deregister_descriptor) runs against a live reactor.
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);
+        // Channel processes are never destroyed, so never killed: their loss would wake
+        // this process's threads while statics die. Each follows its parent itself.
+        static auto* kept = new std::vector<std::shared_ptr<ProcessEntry>>;
+        for (const auto& [name, entry] : s_processes)
+            if (entry && isChannelProcess(name)) kept->push_back(entry);
         s_processes.clear();
         s_exited.clear();
     }
@@ -885,13 +895,6 @@ void SubprocessContainer::terminate(const std::string& name)
 {
     terminateProcess(name);
 }
-
-namespace {
-bool isChannelProcess(const std::string& name)
-{
-    return name.rfind(SubprocessContainer::kChannelProcessPrefix, 0) == 0;
-}
-} // namespace
 
 void SubprocessContainer::terminateAll()
 {

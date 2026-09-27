@@ -15,6 +15,8 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -32,6 +34,7 @@
 #include <future>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 #ifdef __APPLE__
@@ -592,6 +595,26 @@ TEST_F(SubprocessContainerTest, ChannelProcess_IsNoModule) {
     process->terminate();
     EXPECT_FALSE(process->writeLine("gone"));
 }
+
+#ifndef _WIN32
+// exit() in its parent leaves it running: a kill in the parent's static teardown
+// wakes the parent's threads while statics die. (Windows' job object kills it.)
+TEST_F(SubprocessContainerTest, ChannelProcess_OutlivesItsParentsExit) {
+    const auto parent = std::filesystem::path(childPath()).parent_path() / "logos_container_test_parent";
+    const std::string command = "'" + parent.string() + "' '" + childPath() + "' sleep 5";
+    FILE* out = ::popen(command.c_str(), "r");
+    ASSERT_NE(out, nullptr);
+    char line[64] = {};
+    const bool said = std::fgets(line, sizeof line, out) != nullptr;
+    const int status = ::pclose(out);   // once the parent has exited
+    ASSERT_TRUE(said);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+    const pid_t child = static_cast<pid_t>(std::atoll(line));
+    ASSERT_GT(child, 0);
+    EXPECT_EQ(::kill(child, 0), 0) << "its parent's exit killed it";
+    ::kill(child, SIGKILL);
+}
+#endif
 
 TEST_F(SubprocessContainerTest, SendToken_FailsForUnknownProcess) {
     // No entry registered for this name → nothing to write the token to.
