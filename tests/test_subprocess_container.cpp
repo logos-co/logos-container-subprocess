@@ -20,12 +20,21 @@
 #include <thread>
 #include <utility>
 #include <vector>
-#ifndef _WIN32
+#include <filesystem>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <cerrno>
 #include <future>
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
+#endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
 #endif
 
 #ifndef _WIN32
@@ -48,17 +57,36 @@ protected:
     }
 };
 
-// Launch a fake module host under `name` that stays alive ~5s. It must tolerate
-// the extra CLI args the container appends in launch() (e.g. --token-source
-// stdin): /bin/sleep can't be used directly because it rejects unknown options,
-// so we run a shell that execs sleep and ignores the trailing args. exec keeps
-// the pid stable (the shell becomes sleep), matching what the pid assertions
-// expect.
+// The child every test here launches (test_child.cpp), built beside this
+// binary. It takes its behaviour from its arguments, the same way on every
+// platform, and ignores the ones launch() appends (e.g. --token-source stdin).
+static std::string childPath() {
+    namespace fs = std::filesystem;
+    fs::path self;
+#ifdef _WIN32
+    std::wstring buffer(MAX_PATH, L'\0');
+    const DWORD n = ::GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    buffer.resize(n);
+    self = buffer;
+    return (self.parent_path() / "logos_container_test_child.exe").string();
+#elif defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string buffer(size, '\0');
+    _NSGetExecutablePath(buffer.data(), &size);
+    self = fs::canonical(buffer.c_str());
+#else
+    self = fs::read_symlink("/proc/self/exe");
+#endif
+    return (self.parent_path() / "logos_container_test_child").string();
+}
+
+// Launch a fake module host under `name` that stays alive ~5s.
 static bool launchFakeModule(SubprocessContainer& c, const char* name,
                              LogosCore::LoadedModuleHandle& handle) {
     LogosCore::ModuleDescriptor desc;
     desc.name = name;
-    return c.launch(desc, "/bin/sh", {"-c", "exec sleep 5"}, nullptr, handle);
+    return c.launch(desc, childPath(), {"sleep", "5"}, nullptr, handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +158,26 @@ TEST_F(SubprocessContainerTest, Terminate_RemovesModule) {
     EXPECT_FALSE(container.hasModule("term_mod"));
 }
 
+// Detector: on Windows a stop is a WM_QUIT posted to the child's main thread,
+// which cannot be posted before that thread has a message queue. A child
+// stopped while still starting got no request, and the stop waited out the
+// whole 5 s grace period anyway. On Unix, SIGTERM reaches it at once.
+TEST_F(SubprocessContainerTest, Terminate_ReachesAChildThatIsStillStarting) {
+    LogosCore::ModuleDescriptor desc;
+    desc.name = "starting_mod";
+    LogosCore::LoadedModuleHandle handle;
+    ASSERT_TRUE(container.launch(desc, childPath(), {"late-queue", "300", "sleep", "30"},
+                                 nullptr, handle));
+
+    const auto start = std::chrono::steady_clock::now();
+    container.terminate("starting_mod");
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+
+    EXPECT_FALSE(container.hasModule("starting_mod"));
+    EXPECT_LT(ms, 2000) << "the stop waited out the grace period";
+}
+
 TEST_F(SubprocessContainerTest, TerminateAll_RemovesAllModules) {
     LogosCore::LoadedModuleHandle h1;
     launchFakeModule(container, "ta_1", h1);
@@ -187,7 +235,7 @@ TEST_F(SubprocessContainerTest, Launch_OutputCallbackReceivesStdoutAndStderr) {
     };
 
     ASSERT_TRUE(SubprocessContainer::startProcess(
-        "output_test", "/bin/sh", {"-c", "echo out-line; echo err-line >&2"}, cb));
+        "output_test", childPath(), {"streams"}, cb));
 
     std::unique_lock<std::mutex> lock(mtx);
     cv.wait_for(lock, std::chrono::seconds(5),
@@ -224,11 +272,7 @@ TEST_F(SubprocessContainerTest, Launch_OutputCallbackReceivesStdoutAndStderr) {
 // accumulated and emitted as one ~5 MB line, which fails the per-piece bound.
 
 TEST_F(SubprocessContainerTest, Launch_BoundsUnterminatedOutputLine) {
-    // The child writes a fixed number of newline-free bytes via dd. Skip
-    // cleanly if /dev/zero isn't available (some constrained sandboxes).
-    if (access("/dev/zero", R_OK) != 0)
-        GTEST_SKIP() << "/dev/zero not available";
-
+    // The child writes a fixed number of newline-free bytes.
     // ~5 MB of newline-free output: several times the 1 MiB per-line cap, and
     // deliberately not an exact multiple of it so the final EOF flush carries
     // a non-trivial remainder too.
@@ -243,7 +287,7 @@ TEST_F(SubprocessContainerTest, Launch_BoundsUnterminatedOutputLine) {
 
     SubprocessContainer::ProcessCallbacks cb;
     cb.onOutput = [&](const std::string&, const std::string& line, bool isStderr) {
-        if (isStderr) return; // dd's own summary is silenced, but be defensive
+        if (isStderr) return;
         std::lock_guard<std::mutex> lock(mtx);
         received_total += line.size();
         max_piece = std::max(max_piece, line.size());
@@ -255,11 +299,9 @@ TEST_F(SubprocessContainerTest, Launch_BoundsUnterminatedOutputLine) {
         cv.notify_all();
     };
 
-    // bs=1000000 count=5 => exactly 5,000,000 NUL bytes on stdout, no newline.
-    // dd's transfer summary goes to stderr, which we discard.
+    // Exactly 5,000,000 NUL bytes on stdout, no newline.
     ASSERT_TRUE(SubprocessContainer::startProcess(
-        "oom_relay_test", "/bin/sh",
-        {"-c", "dd if=/dev/zero bs=1000000 count=5 2>/dev/null"}, cb));
+        "oom_relay_test", childPath(), {"flood", "5000000"}, cb));
 
     {
         std::unique_lock<std::mutex> lock(mtx);
@@ -328,7 +370,7 @@ TEST_F(SubprocessContainerTest, Launch_OnFinishedReportsCrashedOnSignal) {
     // exercise WIFSIGNALED without depending on /bin/kill -s SEGV syntax
     // or shipping a custom helper binary.
     ASSERT_TRUE(SubprocessContainer::startProcess(
-        "crash_test", "/bin/sh", {"-c", "kill -SEGV $$"}, cb));
+        "crash_test", childPath(), {"crash"}, cb));
 
     std::unique_lock<std::mutex> lock(mtx);
     ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
@@ -340,9 +382,15 @@ TEST_F(SubprocessContainerTest, Launch_OnFinishedReportsCrashedOnSignal) {
         << "container must report crashed=true on signal-exit (WIFSIGNALED). "
            "Without this, the markUnloaded propagation up the stack stalls "
            "and a crashed module looks 'loaded' forever.";
+#ifdef _WIN32
+    // No signals: the exit code is the NTSTATUS the process died with.
+    EXPECT_EQ(static_cast<unsigned long>(gotExitCode), 0xC0000005ul)
+        << "exit_code must carry the access violation. Got " << gotExitCode << ".";
+#else
     EXPECT_EQ(gotExitCode, SIGSEGV)
         << "exit_code must carry the signal number (WTERMSIG), not the "
            "raw waitpid status. Got " << gotExitCode << ".";
+#endif
 
     // Bookkeeping side of the contract: once onFinished has fired the
     // container must no longer claim the module exists. This is what
@@ -378,7 +426,7 @@ TEST_F(SubprocessContainerTest, Launch_OnFinishedReportsPlainExitAsNotCrashed) {
     };
 
     ASSERT_TRUE(SubprocessContainer::startProcess(
-        "exit_test", "/bin/sh", {"-c", "exit 3"}, cb));
+        "exit_test", childPath(), {"exit", "3"}, cb));
 
     std::unique_lock<std::mutex> lock(mtx);
     ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
@@ -419,7 +467,7 @@ TEST_F(SubprocessContainerTest, SendToken_DeliversTokenOverStdin) {
     // `read tok` consumes exactly the one newline-terminated line the parent
     // writes; the child then echoes it so the test can observe what arrived.
     ASSERT_TRUE(SubprocessContainer::startProcess(
-        "tok_stdin", "/bin/sh", {"-c", "read tok; echo \"GOT:$tok\""}, cb));
+        "tok_stdin", childPath(), {"token"}, cb));
 
     const std::string secret = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
     EXPECT_TRUE(SubprocessContainer::sendTokenToProcess("tok_stdin", secret));
@@ -466,13 +514,13 @@ TEST_F(SubprocessContainerTest, Terminate_NoopForUnknown) {
 namespace {
 
 LogosCore::LoadOutcome awaitAfterLaunch(SubprocessContainer& c, const char* name,
-                                        const std::string& script,
+                                        const std::vector<std::string>& script,
                                         std::chrono::milliseconds timeout,
                                         std::chrono::milliseconds& elapsed) {
     LogosCore::ModuleDescriptor desc;
     desc.name = name;
     LogosCore::LoadedModuleHandle handle;
-    if (!c.launch(desc, "/bin/sh", {"-c", script}, nullptr, handle))
+    if (!c.launch(desc, childPath(), script, nullptr, handle))
         return {LogosCore::LoadVerdict::Failed, "launch failed"};
 
     const auto start = std::chrono::steady_clock::now();
@@ -488,7 +536,7 @@ TEST_F(SubprocessContainerTest, AwaitLoad_ReportsLoadedWhenTheChildSaysSo) {
     std::chrono::milliseconds elapsed{};
     const auto out = awaitAfterLaunch(
         container, "ok_mod",
-        "printf '%s\\n' '@logos-load-status ok'; exec sleep 5",
+        {"print", "@logos-load-status ok", "sleep", "5"},
         std::chrono::seconds(5), elapsed);
 
     EXPECT_EQ(out.verdict, LogosCore::LoadVerdict::Loaded);
@@ -499,7 +547,7 @@ TEST_F(SubprocessContainerTest, AwaitLoad_CarriesTheReasonTheChildReported) {
     std::chrono::milliseconds elapsed{};
     const auto out = awaitAfterLaunch(
         container, "failed_mod",
-        "printf '%s\\n' '@logos-load-status failed undefined symbol: logos_module_install'; exit 1",
+        {"print", "@logos-load-status failed undefined symbol: logos_module_install", "exit", "1"},
         std::chrono::seconds(5), elapsed);
 
     EXPECT_EQ(out.verdict, LogosCore::LoadVerdict::Failed);
@@ -508,11 +556,30 @@ TEST_F(SubprocessContainerTest, AwaitLoad_CarriesTheReasonTheChildReported) {
     EXPECT_LT(elapsed, std::chrono::seconds(4));
 }
 
+// The same when the child is gone before the loader asks: a loader running
+// behind its child used to get "exited before it reported" instead.
+TEST_F(SubprocessContainerTest, AwaitLoad_AfterTheChildIsGone_StillCarriesItsReason) {
+    LogosCore::ModuleDescriptor desc;
+    desc.name = "gone_mod";
+    LogosCore::LoadedModuleHandle handle;
+    ASSERT_TRUE(container.launch(desc, childPath(),
+        {"print", "@logos-load-status failed undefined symbol: logos_module_install", "exit", "1"},
+        nullptr, handle));
+    for (int i = 0; i < 250 && container.hasModule("gone_mod"); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    ASSERT_FALSE(container.hasModule("gone_mod"));
+
+    const auto out = container.awaitLoad("gone_mod", std::chrono::seconds(2));
+    EXPECT_EQ(out.verdict, LogosCore::LoadVerdict::Failed);
+    EXPECT_NE(out.reason.find("undefined symbol: logos_module_install"), std::string::npos)
+        << out.reason;
+}
+
 // A child that dies without a word is still a failed load, and the exit code is
 // the only reason available to describe it.
 TEST_F(SubprocessContainerTest, AwaitLoad_ReportsFailureWhenTheChildJustDies) {
     std::chrono::milliseconds elapsed{};
-    const auto out = awaitAfterLaunch(container, "dead_mod", "exit 3",
+    const auto out = awaitAfterLaunch(container, "dead_mod", {"exit", "3"},
                                       std::chrono::seconds(5), elapsed);
 
     EXPECT_EQ(out.verdict, LogosCore::LoadVerdict::Failed);
@@ -524,7 +591,7 @@ TEST_F(SubprocessContainerTest, AwaitLoad_ReportsFailureWhenTheChildJustDies) {
 // module host too old to report the line looks like.
 TEST_F(SubprocessContainerTest, AwaitLoad_ReportsUnknownForASilentLiveChild) {
     std::chrono::milliseconds elapsed{};
-    const auto out = awaitAfterLaunch(container, "silent_mod", "exec sleep 5",
+    const auto out = awaitAfterLaunch(container, "silent_mod", {"sleep", "5"},
                                       std::chrono::milliseconds(300), elapsed);
 
     EXPECT_EQ(out.verdict, LogosCore::LoadVerdict::Unknown);
@@ -550,8 +617,8 @@ TEST_F(SubprocessContainerTest, AwaitLoad_StatusLineIsNotRelayedAsModuleOutput) 
     };
 
     ASSERT_TRUE(SubprocessContainer::startProcess(
-        "quiet_mod", "/bin/sh",
-        {"-c", "printf '%s\\n' '@logos-load-status ok' 'hello'; exec sleep 5"}, cbs));
+        "quiet_mod", childPath(),
+        {"print", "@logos-load-status ok", "print", "hello", "sleep", "5"}, cbs));
 
     const auto out = container.awaitLoad("quiet_mod", std::chrono::seconds(5));
     ASSERT_EQ(out.verdict, LogosCore::LoadVerdict::Loaded);
@@ -704,7 +771,7 @@ TEST_F(SubprocessContainerTest, Launch_DoesNotBlockOnAWedgedChild) {
 // Which thread a child is launched from must not change the child
 //
 // Module hosts arm PR_SET_PDEATHSIG, which Linux fires when the THREAD that
-// spawned them exits, not the process. setpriv arms it the same way here.
+// spawned them exits, not the process. The test child arms it the same way.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -756,13 +823,12 @@ TEST_F(SubprocessContainerTest, Launch_ChildOutlivesTheThreadThatLaunchedIt) {
     std::string armed;
     std::thread launcher([&] {
         ASSERT_TRUE(SubprocessContainer::startProcess(
-            "pdeathsig", "/bin/sh",
-            {"-c", "exec setpriv --pdeathsig KILL sh -c 'echo armed; exec sleep 30'"},
+            "pdeathsig", childPath(), {"pdeathsig", "print", "armed", "sleep", "30"},
             recordInto(child)));
         armed = child->waitForLine("armed", std::chrono::seconds(5));
     });
     launcher.join();
-    ASSERT_EQ(armed, "armed") << "the child never armed PR_SET_PDEATHSIG; is setpriv on PATH?";
+    ASSERT_EQ(armed, "armed") << "the child never armed PR_SET_PDEATHSIG";
 
     {
         std::unique_lock<std::mutex> lock(child->mtx);
