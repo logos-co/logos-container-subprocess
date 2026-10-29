@@ -608,8 +608,9 @@ bool markCloexec(std::initializer_list<int> fds)
 //    and a module host is a windowless QCoreApplication, so no HWND ever
 //    matches its pid: the callback never fires, EnumWindows returns success,
 //    and request_exit reports NO ERROR while doing nothing at all. Every
-//    module would then burn the full 5s grace period and be TerminateProcess'd,
-//    skipping the destructor chain that unlinks its QtRO endpoint.
+//    module would then burn the whole kGracefulExitWindow and be
+//    TerminateProcess'd, skipping the destructor chain that unlinks its QtRO
+//    endpoint.
 //
 //    The working equivalent is PostThreadMessage(WM_QUIT) to the child's MAIN
 //    thread, because Qt's own Win32 dispatcher turns that into
@@ -686,6 +687,12 @@ struct WindowsChildSetup {
 // Synchronous kill
 // ---------------------------------------------------------------------------
 
+// How long a module gets between the stop request and SIGKILL. logos_host
+// spends up to its kUnloadGraceMs (10s) of this on the module's aboutToUnload()
+// hook and needs the rest for its own teardown (`delete logos_api`, unlinking
+// the QtRO socket), so this must stay comfortably above that constant.
+constexpr std::chrono::seconds kGracefulExitWindow{12};
+
 void syncKill(std::shared_ptr<ProcessEntry> entry) {
     if (!entry) return;
 
@@ -725,7 +732,7 @@ void syncKill(std::shared_ptr<ProcessEntry> entry) {
         return true;
     };
 
-    if (!wait(std::chrono::seconds(5))) {
+    if (!wait(kGracefulExitWindow)) {
         spdlog::warn("Process did not terminate gracefully, killing: {}",
                                     entry->name);
         entry->process.terminate(ec);
